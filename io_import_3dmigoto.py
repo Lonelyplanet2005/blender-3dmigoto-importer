@@ -80,6 +80,7 @@ def parse_ini_full(ini_path):
     sections = {}
     resources = {}
     current_section = None
+    current_condition = None
 
     with open(ini_path, 'r', encoding='utf-8', errors='ignore') as f:
         lines = f.readlines()
@@ -91,7 +92,20 @@ def parse_ini_full(ini_path):
             if current_section not in sections:
                 sections[current_section] = {'ib': None, 'vb0': None, 'vb1': None, 'draws': [], 'runs': [], 'textures': {}}
             continue
-        if not current_section or '=' not in s:
+        if not current_section:
+            continue
+
+        # Track if/elif/else/endif for variant grouping
+        if s.startswith('if '):
+            current_condition = s[3:].strip()
+        elif s.startswith('elif '):
+            current_condition = s[5:].strip()
+        elif s == 'else':
+            current_condition = 'else'
+        elif s == 'endif':
+            current_condition = None
+
+        if '=' not in s and not s.lstrip().startswith('drawindexed') and not s.lstrip().startswith('draw '):
             continue
         key, val = s.split('=', 1)
         key, val = key.strip(), val.strip()
@@ -149,17 +163,21 @@ def parse_ini_full(ini_path):
                             name = c
                             break
 
+                variant = current_condition if current_condition and current_condition != 'else' else None
+
                 if is_indexed:
                     sections[current_section]['draws'].append({
                         'name': name, 'section': current_section,
                         'index_count': count, 'start_index': start,
                         'base_vertex': base, 'type': 'drawindexed',
+                        'condition': variant,
                     })
                 else:
                     sections[current_section]['draws'].append({
                         'name': name, 'section': current_section,
                         'vertex_count': count, 'start_vertex': start,
                         'type': 'draw',
+                        'condition': variant,
                     })
 
     # Resolve IB/VB/texture inheritance via run = calls
@@ -196,6 +214,9 @@ def parse_ini_full(ini_path):
             dc['vb0_resource'] = eff_vb0
             dc['vb1_resource'] = eff_vb1
             dc['textures'] = eff_tex.copy()
+            # Propagate condition if not already set
+            if 'condition' not in dc:
+                dc['condition'] = None
             draw_calls.append(dc)
 
     return draw_calls, resources
@@ -434,6 +455,7 @@ def make_material(name, diffuse=None, alpha=False):
     return mat
 
 
+
 def safe_name(name):
     return re.sub(r'[^\w\-. ]', '_', name).strip('_')
 
@@ -656,6 +678,10 @@ class IMPORT_OT_3dmigoto(bpy.types.Operator, ImportHelper):
                 obj, cnt = build_object(dc['name'], positions, uvs, tris, mat, coll)
                 if cnt > 0:
                     obj_count += 1
+                    # Tag with variant condition
+                    cond = dc.get('condition')
+                    if cond:
+                        obj['migoto_condition'] = cond
         else:
             # Merge by IB
             ib_groups = {}
@@ -687,7 +713,34 @@ class IMPORT_OT_3dmigoto(bpy.types.Operator, ImportHelper):
                     if cnt > 0:
                         obj_count += 1
 
-        self.report({'INFO'}, f"Imported {obj_count} objects")
+        # Set up variant visibility
+        # Group objects by condition, hide non-first variants
+        variant_conditions = set()
+        for dc in draw_calls:
+            cond = dc.get('condition')
+            if cond:
+                variant_conditions.add(cond)
+
+        if variant_conditions:
+            # Sort conditions for consistent ordering
+            sorted_conditions = sorted(variant_conditions)
+            first_cond = sorted_conditions[0]
+
+            # Store variant info on collection
+            coll['migoto_variant_var'] = '$swapkey0'  # TODO: detect variable name
+            coll['migoto_variant_conditions'] = '\n'.join(sorted_conditions)
+
+            # Tag and hide objects
+            for obj in coll.objects:
+                if obj.type != 'MESH':
+                    continue
+                # Find which condition this object belongs to
+                obj_cond = obj.get('migoto_condition', None)
+                if obj_cond:
+                    obj.hide_viewport = (obj_cond != first_cond)
+                    obj.hide_render = (obj_cond != first_cond)
+
+        self.report({'INFO'}, f"导入 {obj_count} 个对象 / Imported {obj_count} objects")
         return {'FINISHED'}
 
 
@@ -954,6 +1007,317 @@ class MIGOTO_OT_export_textures(bpy.types.Operator):
         return {'RUNNING_MODAL'}
 
 
+class MIGOTO_PG_mesh_group_item(bpy.types.PropertyGroup):
+    """单个对象在分组中的条目"""
+    obj_name: bpy.props.StringProperty(name="Object Name")
+
+
+class MIGOTO_PG_mesh_group(bpy.types.PropertyGroup):
+    """网格变体分组"""
+    name: bpy.props.StringProperty(name="分组名 / Group Name", default="Group")
+    items: bpy.props.CollectionProperty(type=MIGOTO_PG_mesh_group_item)
+    active_index: bpy.props.IntProperty(name="Active", default=0)
+
+
+class MIGOTO_PG_mesh_groups(bpy.types.PropertyGroup):
+    """所有分组"""
+    groups: bpy.props.CollectionProperty(type=MIGOTO_PG_mesh_group)
+    active_group: bpy.props.IntProperty(name="Active Group", default=0)
+
+
+class MIGOTO_OT_add_group(bpy.types.Operator):
+    """添加分组 / Add Group"""
+    bl_idname = "migoto.add_group"
+    bl_label = "Add Group"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        scene = context.scene
+        if not hasattr(scene, 'migoto_mesh_groups'):
+            scene.migoto_mesh_groups = bpy.props.PointerProperty(type=MIGOTO_PG_mesh_groups)
+        mg = scene.migoto_mesh_groups
+        g = mg.groups.add()
+        g.name = f"分组 {len(mg.groups)}"
+        mg.active_group = len(mg.groups) - 1
+        return {'FINISHED'}
+
+
+class MIGOTO_OT_remove_group(bpy.types.Operator):
+    """删除分组 / Remove Group"""
+    bl_idname = "migoto.remove_group"
+    bl_label = "Remove Group"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    index: bpy.props.IntProperty()
+
+    def execute(self, context):
+        mg = context.scene.migoto_mesh_groups
+        if 0 <= self.index < len(mg.groups):
+            # Unhide all objects in this group
+            group = mg.groups[self.index]
+            for item in group.items:
+                obj = bpy.data.objects.get(item.obj_name)
+                if obj:
+                    obj.hide_viewport = False
+                    obj.hide_render = False
+            mg.groups.remove(self.index)
+        return {'FINISHED'}
+
+
+class MIGOTO_OT_add_obj_to_group(bpy.types.Operator):
+    """添加选中对象到分组 / Add selected objects to group"""
+    bl_idname = "migoto.add_obj_to_group"
+    bl_label = "Add Selected"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    group_index: bpy.props.IntProperty()
+
+    def execute(self, context):
+        mg = context.scene.migoto_mesh_groups
+        if self.group_index >= len(mg.groups):
+            return {'CANCELLED'}
+        group = mg.groups[self.group_index]
+        existing = {item.obj_name for item in group.items}
+        added = 0
+        for obj in context.selected_objects:
+            if obj.type == 'MESH' and obj.name not in existing:
+                item = group.items.add()
+                item.obj_name = obj.name
+                added += 1
+        # Hide all but first
+        if len(group.items) > 1:
+            for i, item in enumerate(group.items):
+                obj = bpy.data.objects.get(item.obj_name)
+                if obj:
+                    obj.hide_viewport = (i != 0)
+                    obj.hide_render = (i != 0)
+                    group.active_index = 0
+        self.report({'INFO'}, f'添加 {added} 个对象 / Added {added} objects')
+        return {'FINISHED'}
+
+
+class MIGOTO_OT_remove_obj_from_group(bpy.types.Operator):
+    """从分组移除对象 / Remove object from group"""
+    bl_idname = "migoto.remove_obj_from_group"
+    bl_label = "Remove"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    group_index: bpy.props.IntProperty()
+    item_index: bpy.props.IntProperty()
+
+    def execute(self, context):
+        mg = context.scene.migoto_mesh_groups
+        if self.group_index >= len(mg.groups):
+            return {'CANCELLED'}
+        group = mg.groups[self.group_index]
+        if 0 <= self.item_index < len(group.items):
+            # Unhide this object
+            obj = bpy.data.objects.get(group.items[self.item_index].obj_name)
+            if obj:
+                obj.hide_viewport = False
+                obj.hide_render = False
+            group.items.remove(self.item_index)
+        return {'FINISHED'}
+
+
+class MIGOTO_OT_toggle_obj_visibility(bpy.types.Operator):
+    """切换对象可见性 / Toggle object visibility"""
+    bl_idname = "migoto.toggle_obj_visibility"
+    bl_label = "Toggle"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    obj_name: bpy.props.StringProperty()
+
+    def execute(self, context):
+        obj = bpy.data.objects.get(self.obj_name)
+        if obj:
+            obj.hide_viewport = not obj.hide_viewport
+            obj.hide_render = not obj.hide_render
+        return {'FINISHED'}
+
+
+class MIGOTO_OT_show_all_in_group(bpy.types.Operator):
+    """显示组内全部 / Show all in group"""
+    bl_idname = "migoto.show_all_in_group"
+    bl_label = "Show All"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    group_index: bpy.props.IntProperty()
+
+    def execute(self, context):
+        mg = context.scene.migoto_mesh_groups
+        if self.group_index < len(mg.groups):
+            for item in mg.groups[self.group_index].items:
+                obj = bpy.data.objects.get(item.obj_name)
+                if obj:
+                    obj.hide_viewport = False
+                    obj.hide_render = False
+        return {'FINISHED'}
+
+
+class MIGOTO_OT_hide_all_in_group(bpy.types.Operator):
+    """隐藏组内全部 / Hide all in group"""
+    bl_idname = "migoto.hide_all_in_group"
+    bl_label = "Hide All"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    group_index: bpy.props.IntProperty()
+
+    def execute(self, context):
+        mg = context.scene.migoto_mesh_groups
+        if self.group_index < len(mg.groups):
+            for item in mg.groups[self.group_index].items:
+                obj = bpy.data.objects.get(item.obj_name)
+                if obj:
+                    obj.hide_viewport = True
+                    obj.hide_render = True
+        return {'FINISHED'}
+
+
+class MIGOTO_OT_rename_group(bpy.types.Operator):
+    """重命名分组 / Rename Group"""
+    bl_idname = "migoto.rename_group"
+    bl_label = "Rename"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    group_index: bpy.props.IntProperty()
+    new_name: bpy.props.StringProperty(name="Name", default="Group")
+
+    def execute(self, context):
+        mg = context.scene.migoto_mesh_groups
+        if 0 <= self.group_index < len(mg.groups):
+            mg.groups[self.group_index].name = self.new_name
+        return {'FINISHED'}
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self)
+
+
+class MIGOTO_OT_auto_group(bpy.types.Operator):
+    """自动按INI条件分组 / Auto-group by INI conditions"""
+    bl_idname = "migoto.auto_group"
+    bl_label = "Auto Group"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        scene = context.scene
+        if not hasattr(scene, 'migoto_mesh_groups'):
+            scene.migoto_mesh_groups = bpy.props.PointerProperty(type=MIGOTO_PG_mesh_groups)
+        mg = scene.migoto_mesh_groups
+
+        # Find migoto collection
+        for coll in bpy.data.collections:
+            if 'migoto_ini_dir' not in coll:
+                continue
+
+            # Group by condition
+            cond_objects = {}  # condition -> [obj_name, ...]
+            for obj in coll.objects:
+                if obj.type != 'MESH':
+                    continue
+                cond = obj.get('migoto_condition', None)
+                if cond:
+                    if cond not in cond_objects:
+                        cond_objects[cond] = []
+                    cond_objects[cond].append(obj.name)
+
+            if not cond_objects:
+                self.report({'INFO'}, 'No variant conditions found')
+                return {'CANCELLED'}
+
+            # Create one group with all variants
+            mg.groups.clear()
+            g = mg.groups.add()
+            g.name = "变体 / Variants"
+            for cond, obj_names in sorted(cond_objects.items()):
+                for oname in obj_names:
+                    item = g.items.add()
+                    item.obj_name = oname
+            # Hide all but first
+            for i, item in enumerate(g.items):
+                obj = bpy.data.objects.get(item.obj_name)
+                if obj:
+                    obj.hide_viewport = (i != 0)
+                    obj.hide_render = (i != 0)
+            g.active_index = 0
+
+            # Also group always-visible objects separately
+            always_visible = []
+            for obj in coll.objects:
+                if obj.type == 'MESH' and not obj.get('migoto_condition'):
+                    always_visible.append(obj.name)
+
+            break
+
+        self.report({'INFO'}, f'Created {len(mg.groups)} groups')
+        return {'FINISHED'}
+
+
+class MIGOTO_PT_mesh_groups(bpy.types.Panel):
+    """网格变体分组面板"""
+    bl_label = "网格变体 / Mesh Variants"
+    bl_idname = "MIGOTO_PT_mesh_groups"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = '3Dmigoto'
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+
+        # Auto-group button
+        row = layout.row()
+        row.operator('migoto.auto_group', text='自动分组 / Auto Group', icon='FILTER')
+        row.operator('migoto.add_group', text='添加分组 / Add Group', icon='ADD')
+
+        if not hasattr(scene, 'migoto_mesh_groups'):
+            return
+        mg = scene.migoto_mesh_groups
+
+        if not mg.groups:
+            layout.label(text='无分组 / No groups')
+            return
+
+        for g_idx, group in enumerate(mg.groups):
+            box = layout.box()
+
+            # Group header
+            row = box.row()
+            row.label(text=group.name, icon='GROUP')
+            op = row.operator('migoto.rename_group', text='', icon='GREASEPENCIL')
+            op.group_index = g_idx
+            op = row.operator('migoto.remove_group', text='', icon='X')
+            op.index = g_idx
+
+            # Add selected button
+            op = box.operator('migoto.add_obj_to_group', text='添加选中 / Add Selected', icon='ADD')
+            op.group_index = g_idx
+
+            # List objects with independent checkboxes
+            for i_idx, item in enumerate(group.items):
+                row = box.row()
+                obj = bpy.data.objects.get(item.obj_name)
+
+                # Checkbox toggle
+                is_visible = obj and not obj.hide_viewport
+                icon = 'CHECKBOX_HLT' if is_visible else 'CHECKBOX_DEHLT'
+                op = row.operator('migoto.toggle_obj_visibility', text=item.obj_name, icon=icon)
+                op.obj_name = item.obj_name
+
+                # Remove button
+                op = row.operator('migoto.remove_obj_from_group', text='', icon='TRASH')
+                op.group_index = g_idx
+                op.item_index = i_idx
+
+            # Show all / Hide all
+            row = box.row(align=True)
+            op = row.operator('migoto.show_all_in_group', text='全部显示 / Show All', icon='HIDE_OFF')
+            op.group_index = g_idx
+            op = row.operator('migoto.hide_all_in_group', text='全部隐藏 / Hide All', icon='HIDE_ON')
+            op.group_index = g_idx
+
+
 class MIGOTO_PT_panel(bpy.types.Panel):
     """3Dmigoto Model Variant Panel"""
     bl_label = "3Dmigoto 变体 / Variants"
@@ -977,7 +1341,7 @@ class MIGOTO_PT_panel(bpy.types.Panel):
         layout.operator('migoto.export_textures', text='导出贴图 / Export Textures', icon='EXPORT')
         layout.separator()
 
-        # Show variants
+        # Texture variants
         if not hasattr(scene, 'migoto_variants'):
             layout.label(text='未加载变体 / No variants loaded')
             return
@@ -1004,9 +1368,22 @@ classes = (
     MIGOTO_PG_variant,
     MIGOTO_PG_material_variants,
     MIGOTO_PG_model_variants,
+    MIGOTO_PG_mesh_group_item,
+    MIGOTO_PG_mesh_group,
+    MIGOTO_PG_mesh_groups,
     MIGOTO_OT_switch_variant,
+    MIGOTO_OT_add_group,
+    MIGOTO_OT_remove_group,
+    MIGOTO_OT_add_obj_to_group,
+    MIGOTO_OT_remove_obj_from_group,
+    MIGOTO_OT_toggle_obj_visibility,
+    MIGOTO_OT_show_all_in_group,
+    MIGOTO_OT_hide_all_in_group,
+    MIGOTO_OT_rename_group,
+    MIGOTO_OT_auto_group,
     MIGOTO_OT_scan_variants,
     MIGOTO_OT_export_textures,
+    MIGOTO_PT_mesh_groups,
     MIGOTO_PT_panel,
     IMPORT_OT_3dmigoto,
 )
@@ -1017,6 +1394,7 @@ def register():
         bpy.utils.register_class(cls)
     bpy.types.TOPBAR_MT_file_import.append(menu_fn)
     bpy.types.Scene.migoto_variants = bpy.props.PointerProperty(type=MIGOTO_PG_model_variants)
+    bpy.types.Scene.migoto_mesh_groups = bpy.props.PointerProperty(type=MIGOTO_PG_mesh_groups)
 
 
 def unregister():
@@ -1024,6 +1402,7 @@ def unregister():
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
     del bpy.types.Scene.migoto_variants
+    del bpy.types.Scene.migoto_mesh_groups
 
 if __name__ == "__main__":
     register()

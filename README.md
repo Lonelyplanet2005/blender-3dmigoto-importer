@@ -1,26 +1,27 @@
 # 3Dmigoto/XXMI Model Importer for Blender
 
-Blender 插件，用于导入 3Dmigoto/XXMI 格式的游戏 MOD 模型（如绝区零、原神等）。
+Blender 插件，用于导入 3Dmigoto/XXMI 格式的游戏 MOD 模型（绝区零、原神、崩坏星穹铁道等）。
 
 A Blender addon for importing 3Dmigoto/XXMI game mod models (Zenless Zone Zero, Genshin Impact, etc.)
 
-## ⚠️此项目为100%AI项目
+##⚠️此项目为100%AI项目
 
 ## ✨ 功能 / Features
 
 - 🎮 直接导入 `.ini` 文件，自动解析所有关联的 `.buf`、`.ib`、`.dds` 文件
 - 🧩 自动按 draw call 分离网格部件
 - 🎨 自动加载贴图并创建 PBR 材质
-- 🔄 支持变体贴图切换（如不同颜色的服装）
+- 🔄 支持贴图变体切换（如不同颜色的服装）
+- 📦 网格变体分组系统（手动分组 + 独立勾选显示/隐藏）
 - 📁 自动搜索子目录结构
-- 📦 DDS 自动转 PNG（需 Pillow）
+- 📤 一键导出贴图（DDS 自动转 PNG）
 - 🌐 中英双语界面
 
 ## 📥 安装 / Installation
 
 1. 下载 `io_import_3dmigoto.py`
-2. Blender → Edit → Preferences → Add-ons → Install... → 选择文件
-3. 勾选启用
+2. 打开 Blender → Edit → Preferences → Add-ons
+3. 点击右上角 **Install...** → 选择文件 → 勾选启用
 
 ### 安装 Pillow（用于 DDS 贴图转换）
 
@@ -47,15 +48,23 @@ File → Import → 3Dmigoto 模型 (.ini) → 选择 MOD 包中的 `.ini` 文�
 | 分离部件 | 每个 draw call 创建独立对象 | ✅ |
 | 加载贴图 | 加载贴图并创建材质 | ✅ |
 
-### 切换变体贴图
+### 网格变体分组
 
-1. 3D 视口侧边栏（按 N）→ 3Dmigoto 变体
-2. 点击 **扫描变体**
-3. 点击切换不同颜色/样式
+侧边栏 → 3Dmigoto → 网格变体
+
+- **自动分组** — 按 INI 条件自动归类
+- **添加分组** — 创建自定义分组
+- **添加选中** — 将场景中选中的对象加入分组
+- **独立勾选** — ✅/☐ 切换单个对象可见性（可同时显示多个）
+- **全部显示/隐藏** — 一键控制组内所有对象
+
+### 贴图变体切换
+
+侧边栏 → 3Dmigoto → 扫描变体 → 点击切换不同颜色/样式
 
 ### 导出贴图
 
-侧边栏 → **导出贴图** → 选择目标文件夹（DDS 自动转 PNG）
+侧边栏 → 3Dmigoto → 导出贴图 → 选择目标文件夹（DDS 自动转 PNG）
 
 ## 📂 支持的文件结构
 
@@ -96,7 +105,13 @@ MOD文件夹/
 | Position | 40 | 3×float32 (XYZ) |
 | Texcoord | 24/20 | half-float UV @ offset 4 |
 | Blend | 32 | 4×float32 权重 + 4×uint32 骨骼 |
-| Index | 4 | R32_UINT |
+| Index | 4 | R32_UINT (4 字节/索引) |
+
+### IB→VB 匹配
+
+支持两种命名格式：
+- Hash 格式：`Resource_b3c6ea5a_Component1` → 提取 `b3c6ea5a` → 匹配 `Resourceb3c6ea5aPosition`
+- 命名格式：`ResourceSunnaBodyAIB` → 提取 `SunnaBody` → 匹配 `ResourceSunnaBodyPosition`
 
 ## 📄 许可证 / License
 
