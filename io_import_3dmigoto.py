@@ -18,6 +18,7 @@ bl_info = {
     "category": "Import-Export",
 }
 
+
 import bpy
 import bmesh
 import struct
