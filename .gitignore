@@ -1,0 +1,22 @@
+# Blender
+*.blend1
+*.blend2
+__pycache__/
+
+# Python
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
