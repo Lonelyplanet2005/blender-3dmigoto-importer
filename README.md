@@ -4,6 +4,8 @@ Blender 插件，用于导入 3Dmigoto/XXMI 格式的游戏 MOD 模型。
 
 A Blender addon for importing 3Dmigoto/XXMI game mod models.
 
+## 此项目为100%AI项目
+
 ## 支持的游戏 / Supported Games
 
 - 绝区零 / Zenless Zone Zero
