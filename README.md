@@ -1,118 +1,110 @@
 # 3Dmigoto/XXMI Model Importer for Blender
 
-Blender 插件，用于导入 3Dmigoto/XXMI 格式的游戏 MOD 模型（绝区零、原神、崩坏星穹铁道等）。
+Blender 插件，用于导入 3Dmigoto/XXMI 格式的游戏 MOD 模型。
 
-A Blender addon for importing 3Dmigoto/XXMI game mod models (Zenless Zone Zero, Genshin Impact, etc.)
+A Blender addon for importing 3Dmigoto/XXMI game mod models.
 
-##此项目为100%AI项目
-
-## ✨ 功能 / Features
-
-- 🎮 直接导入 `.ini` 文件，自动解析所有关联的 `.buf`、`.ib`、`.dds` 文件
-- 🧩 自动按 draw call 分离网格部件
-- 🎨 自动加载贴图并创建 PBR 材质
-- 🔄 支持贴图变体切换（如不同颜色的服装）
-- 📦 网格变体分组系统（手动分组 + 独立勾选显示/隐藏）
-- 📁 自动搜索子目录结构
-- 📤 一键导出贴图（DDS 自动转 PNG）
-- 🌐 中英双语界面
-
-## 📥 安装 / Installation
-
-1. 下载 `io_import_3dmigoto.py`
-2. 打开 Blender → Edit → Preferences → Add-ons
-3. 点击右上角 **Install...** → 选择文件 → 勾选启用
-
-### 安装 Pillow（用于 DDS 贴图转换）
-
-在 Blender 中：Scripting 工作区 → 新建脚本 → 运行：
-
-```python
-import subprocess, sys
-subprocess.call([sys.executable, '-m', 'pip', 'install', 'Pillow'])
-print("Done!")
-```
-
-## 🚀 使用方法 / Usage
-
-### 导入模型
-
-File → Import → 3Dmigoto 模型 (.ini) → 选择 MOD 包中的 `.ini` 文件
-
-### 导入选项
-
-| 选项 / Option | 说明 / Description | 默认 |
-|---|---|---|
-| 应用 -90° X 旋转 | 使模型在 Blender 中直立 | ✅ |
-| 镜像 X 轴 | 左右翻转模型 | ❌ |
-| 分离部件 | 每个 draw call 创建独立对象 | ✅ |
-| 加载贴图 | 加载贴图并创建材质 | ✅ |
-
-### 网格变体分组
-
-侧边栏 → 3Dmigoto → 网格变体
-
-- **自动分组** — 按 INI 条件自动归类
-- **添加分组** — 创建自定义分组
-- **添加选中** — 将场景中选中的对象加入分组
-- **独立勾选** — ✅/☐ 切换单个对象可见性（可同时显示多个）
-- **全部显示/隐藏** — 一键控制组内所有对象
-
-### 贴图变体切换
-
-侧边栏 → 3Dmigoto → 扫描变体 → 点击切换不同颜色/样式
-
-### 导出贴图
-
-侧边栏 → 3Dmigoto → 导出贴图 → 选择目标文件夹（DDS 自动转 PNG）
-
-## 📂 支持的文件结构
-
-```
-MOD文件夹/
-├── Model.ini              ← 选择此文件
-├── Buffer/
-│   ├── xxx-Position.buf
-│   ├── xxx-Texcoord.buf
-│   └── xxx-Component1.buf
-├── Texture/
-│   └── xxx_DiffuseMap.dds
-└── textures/              ← 或这种结构
-    ├── body/Base.dds
-    └── head/Base.dds
-```
-
-## ⚠️ 已知限制
-
-- 不支持骨骼/动画（仅静态网格）
-- 不支持 Blend Shape
-- INI 中的条件逻辑（`if $var == X`）不生效，所有 draw call 均导入
-- 脸部模型可能不在 MOD 包中（仅覆盖贴图）
-
-## 📋 支持的游戏 / Supported Games
-
-理论上支持所有使用 3Dmigoto/XXMI 框架的 MOD，包括：
+## 支持的游戏 / Supported Games
 
 - 绝区零 / Zenless Zone Zero
 - 原神 / Genshin Impact
 - 崩坏：星穹铁道 / Honkai: Star Rail
 - 鸣潮 / Wuthering Waves
 
-## 🛠️ 技术细节
+## 功能 / Features
 
-| 缓冲类型 | Stride | 数据 |
-|---|---|---|
-| Position | 40 | 3×float32 (XYZ) |
-| Texcoord | 24/20 | half-float UV @ offset 4 |
-| Blend | 32 | 4×float32 权重 + 4×uint32 骨骼 |
-| Index | 4 | R32_UINT (4 字节/索引) |
+- 🎮 直接导入 `.ini` 文件，自动解析 `.buf`、`.ib`、`.dds`
+- 🧩 自动按 draw call 分离网格部件
+- 🎨 自动分配贴图（支持 ps-t0、this = 等多种格式）
+- 🔄 贴图变体切换（侧边栏面板）
+- 📦 网格变体分组（手动分组 + 独立勾选显示/隐藏）
+- 📤 一键导出贴图（DDS 自动转 PNG）
+- 🔧 手动旋转 XYZ / 镜像 XYZ
+- 🎯 UV 格式自动检测 + 手动选择
+- 🌐 中英双语界面
 
-### IB→VB 匹配
+## 安装 / Installation
 
-支持两种命名格式：
-- Hash 格式：`Resource_b3c6ea5a_Component1` → 提取 `b3c6ea5a` → 匹配 `Resourceb3c6ea5aPosition`
-- 命名格式：`ResourceSunnaBodyAIB` → 提取 `SunnaBody` → 匹配 `ResourceSunnaBodyPosition`
+1. 下载 `io_import_3dmigoto.py`
+2. Blender → Edit → Preferences → Add-ons → Install
+3. 勾选启用
 
-## 📄 许可证 / License
+### 安装 Pillow（推荐，用于 DDS 转换）
+
+Blender → Scripting → 新建脚本 → 运行：
+
+```python
+import subprocess, sys
+subprocess.call([sys.executable, '-m', 'pip', 'install', 'Pillow'])
+```
+
+## 使用 / Usage
+
+### 导入模型
+
+```
+File → Import → 3Dmigoto 模型 (.ini)
+```
+
+### 导入选项
+
+| 选项 | 说明 | 默认 |
+|------|------|------|
+| 镜像 X/Y/Z | 翻转模型 | 关 |
+| X/Y/Z 旋转 | 手动旋转角度 | 0° |
+| 分离部件 | 每个 draw call 独立对象 | 开 |
+| 加载贴图 | 加载并分配贴图 | 开 |
+| UV 格式 | UV 坐标格式 | 自动检测 |
+
+### UV 格式选择
+
+自动检测可能选错，如贴图映射异常请手动选择：
+
+| 格式 | 适用场景 |
+|------|----------|
+| auto | 自动检测（可能不准） |
+| hf0 / hf4 | Half-float 格式 |
+| u16_0 / u16_2 / u16_4 | uint16 UNORM 格式 |
+| f32_4 / f32_0 | float32 格式 |
+
+### 侧边栏面板
+
+3D 视口按 N → 3Dmigoto 标签：
+
+- **导入模型** — 快捷导入
+- **导出贴图** — 一键导出所有贴图
+- **贴图浏览器** — 选中对象后加载贴图列表，点击切换
+- **网格变体** — 手动分组控制部件显隐
+
+## 文件结构支持
+
+```
+MOD文件夹/
+├── Model.ini
+├── *.buf / *.ib
+├── *.dds
+└── textures/
+    ├── body/Blue.dds
+    └── head/Base.dds
+```
+
+支持子目录结构，自动搜索 INI 所在目录及上级目录。
+
+## 技术细节
+
+| 缓冲类型 | Stride | 格式 |
+|----------|--------|------|
+| Position | 40 | 3×float32 XYZ |
+| Texcoord | 8/16/20/24 | half-float / uint16 / float32 |
+| Blend | 32 | 4×float32 + 4×uint32 |
+| Index | 4 | R32_UINT |
+
+## 已知限制
+
+- 不支持骨骼/动画
+- 不支持 Blend Shape
+- INI 条件逻辑不生效，所有 draw call 均导入
+
+## 许可证 / License
 
 MIT License

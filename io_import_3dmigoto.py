@@ -11,15 +11,15 @@ Usage:
 bl_info = {
     "name": "3Dmigoto/XXMI Model Importer",
     "author": "OpenClaw",
-    "version": (1, 2, 0),
+    "version": (3, 0, 0),
     "blender": (3, 0, 0),
     "location": "File > Import > 3Dmigoto Model (.ini)",
     "description": "Import 3Dmigoto/XXMI game mod models",
     "category": "Import-Export",
 }
 
-
 import bpy
+import bpy.utils.previews
 import bmesh
 import struct
 import os
@@ -27,41 +27,130 @@ import re
 from bpy_extras.io_utils import ImportHelper
 from bpy.props import StringProperty, BoolProperty
 
+# Module-level preview storage
+_preview_collections = {}
+
 
 # ============================================================
 # Binary Readers
 # ============================================================
 
-def read_positions(filepath, stride=40, rotate=True, mirror_x=False):
-    """Read XYZ positions. If rotate=True, apply -90° X rotation for Blender."""
+def read_positions(filepath, stride=40, mirror_x=False, mirror_y=False, mirror_z=False, rot_x=0, rot_y=0, rot_z=0):
+    """Read XYZ positions with optional rotation and mirror."""
+    import math
     with open(filepath, 'rb') as f:
         data = f.read()
     n = len(data) // stride
+
+    # Build rotation matrix from Euler angles (XYZ order)
+    cx, sx = math.cos(rot_x), math.sin(rot_x)
+    cy, sy = math.cos(rot_y), math.sin(rot_y)
+    cz, sz = math.cos(rot_z), math.sin(rot_z)
+    m00 = cx*cy;  m01 = cx*sy*sz - sx*cz;  m02 = cx*sy*cz + sx*sz
+    m10 = sx*cy;  m11 = sx*sy*sz + cx*cz;  m12 = sx*sy*cz - cx*sz
+    m20 = -sy;    m21 = cy*sz;              m22 = cy*cz
+
+    # Mirror factors
+    mx = -1.0 if mirror_x else 1.0
+    my = -1.0 if mirror_y else 1.0
+    mz = -1.0 if mirror_z else 1.0
+
     out = []
     for i in range(n):
         x, y, z = struct.unpack_from('<3f', data, i * stride)
-        if rotate:
-            # -90° X: (x,y,z) -> (x, z, -y)
-            if mirror_x:
-                out.append((-x, z, -y))
-            else:
-                out.append((x, z, -y))
-        else:
-            if mirror_x:
-                out.append((-x, y, z))
-            else:
-                out.append((x, y, z))
+        x *= mx; y *= my; z *= mz
+        nx = m00*x + m01*y + m02*z
+        ny = m10*x + m11*y + m12*z
+        nz = m20*x + m21*y + m22*z
+        out.append((nx, ny, nz))
     return out
 
 
-def read_uvs(filepath, stride, hf_offset=4):
-    """Read UVs as half-floats at hf_offset. Flip V for Blender."""
+
+def read_uvs(filepath, stride, hf_offset=None, uv_format="auto"):
+    """Read UVs. Auto-detect format (half-float vs uint16 UNORM) and offset."""
     with open(filepath, 'rb') as f:
         data = f.read()
     n = len(data) // stride
+
+    if hf_offset is not None:
+        return [(u, 1.0 - v) for u, v in (struct.unpack_from('<ee', data, i * stride + hf_offset) for i in range(n))]
+
+    # Manual format selection
+    if uv_format != 'auto':
+        fmt_map = {'hf0': ('hf',0), 'hf4': ('hf',4), 'u16_0': ('u16',0), 'u16_2': ('u16',2), 'u16_4': ('u16',4), 'f32_4': ('f32',4), 'f32_0': ('f32',0)}
+        if uv_format in fmt_map:
+            fmt, off = fmt_map[uv_format]
+            print(f"  [Migoto] UV: manual format={fmt}, offset={off}")
+            out = []
+            for i in range(n):
+                if fmt == 'hf':
+                    u, v = struct.unpack_from('<ee', data, i * stride + off)
+                elif fmt == 'u16':
+                    u16, v16 = struct.unpack_from('<HH', data, i * stride + off)
+                    u, v = u16 / 65535.0, v16 / 65535.0
+                else:
+                    u, v = struct.unpack_from('<2f', data, i * stride + off)
+                out.append((u, 1.0 - v))
+            return out
+
+    # Auto-detect: test all formats: half-float, uint16 UNORM, float32
+    candidates = []
+    for offset in ([0, 4, 8] if stride <= 16 else [4, 0, 8]):
+        if offset + 4 <= stride:
+            candidates.append(('hf', offset))
+    for offset in range(0, min(stride, 16), 2):
+        if offset + 4 <= stride:
+            candidates.append(('u16', offset))
+    for offset in range(0, min(stride, 20), 4):
+        if offset + 8 <= stride:
+            candidates.append(('f32', offset))
+
+    best_fmt, best_off, best_score = 'hf', 0, -1
+    for fmt, off in candidates:
+        score = 0
+        u_vals, v_vals = [], []
+        sample = min(2000, n)
+        for i in range(sample):
+            try:
+                if fmt == 'hf':
+                    u, v = struct.unpack_from('<ee', data, i * stride + off)
+                elif fmt == 'u16':
+                    u16, v16 = struct.unpack_from('<HH', data, i * stride + off)
+                    u, v = u16 / 65535.0, v16 / 65535.0
+                else:  # f32
+                    u, v = struct.unpack_from('<2f', data, i * stride + off)
+                if 0.0 <= u <= 1.0 and 0.0 <= v <= 1.0:
+                    score += 1
+                    u_vals.append(u)
+                    v_vals.append(v)
+            except:
+                pass
+        # Prefer formats with wide UV coverage (at least one axis > 50%)
+        if len(u_vals) > 10:
+            u_range = max(u_vals) - min(u_vals)
+            v_range = max(v_vals) - min(v_vals)
+            coverage = max(u_range, v_range)  # Best axis coverage
+            # Bonus for both axes having range
+            if u_range > 0.1 and v_range > 0.1:
+                score = int(score * 1.5)
+            # Penalty if both axes are narrow
+            if coverage < 0.3:
+                score = score // 5
+        if score > best_score:
+            best_score, best_fmt, best_off = score, fmt, off
+
+    print(f"  [Migoto] UV: stride={stride}, format={best_fmt}, offset={best_off} ({best_score}/{min(2000, n)} valid)")
+
     out = []
     for i in range(n):
-        u, v = struct.unpack_from('<ee', data, i * stride + hf_offset)
+        if best_fmt == 'hf':
+            u, v = struct.unpack_from('<ee', data, i * stride + best_off)
+        elif best_fmt == 'u16':
+            u16, v16 = struct.unpack_from('<HH', data, i * stride + best_off)
+            u, v = u16 / 65535.0, v16 / 65535.0
+        else:  # f32
+            u, v = struct.unpack_from('<2f', data, i * stride + best_off)
         out.append((u, 1.0 - v))
     return out
 
@@ -75,6 +164,117 @@ def read_indices(filepath):
 # ============================================================
 # INI Parser
 # ============================================================
+
+def _resolve_lookup(resolved, name):
+    """Case-insensitive resource name lookup."""
+    if not name:
+        return None
+    if name in resolved:
+        return resolved[name]
+    name_lower = name.lower()
+    for k, v in resolved.items():
+        if k.lower() == name_lower:
+            return v
+    return None
+
+
+def build_component_texture_map(ini_path, ini_dir, resolved):
+    """Parse INI to build section -> texture mapping.
+    Handles both WWMI (this = ResourceXXX) and 3Dmigoto (ps-t0 = ResourceXXX) formats."""
+    import re as _re
+    
+    resource_files = {}
+    section_tex_refs = {}  # section_name -> [resource_names]
+    current_section = None
+    
+    with open(ini_path, 'r', encoding='utf-8', errors='ignore') as f:
+        for line in f:
+            s = line.strip()
+            if s.startswith('[') and s.endswith(']'):
+                current_section = s[1:-1]
+                continue
+            if '=' not in s or not current_section:
+                continue
+            key, val = s.split('=', 1)
+            key, val = key.strip(), val.strip()
+            
+            if key == 'filename' and current_section.startswith('Resource'):
+                resource_files[current_section] = val
+            
+            # WWMI format: this = ResourceTextureN
+            if key == 'this' and val.startswith('Resource'):
+                if current_section not in section_tex_refs:
+                    section_tex_refs[current_section] = []
+                section_tex_refs[current_section].append(val)
+            
+            # 3Dmigoto format: ps-t0 = ResourceXXX (diffuse)
+            if key == 'ps-t0' and val.startswith('Resource'):
+                if current_section not in section_tex_refs:
+                    section_tex_refs[current_section] = []
+                section_tex_refs[current_section].append(val)
+    
+    # Build section -> texture paths
+    section_textures = {}
+    for section, res_names in section_tex_refs.items():
+        for res_name in res_names:
+            # Try resolved lookup
+            res_data = _resolve_lookup(resolved, res_name)
+            if res_data and res_data.get('path') and os.path.exists(res_data['path']):
+                if section not in section_textures:
+                    section_textures[section] = []
+                section_textures[section].append(res_data['path'])
+                continue
+            
+            # Try resource filename
+            fname = resource_files.get(res_name, '')
+            if fname:
+                fp = os.path.join(ini_dir, fname)
+                if os.path.exists(fp):
+                    if section not in section_textures:
+                        section_textures[section] = []
+                    section_textures[section].append(fp)
+                    continue
+            
+            # Try to find by resource name in file system
+            clean_name = res_name.replace('Resource', '')
+            for f in os.listdir(ini_dir):
+                if clean_name.lower() in f.lower() and f.lower().endswith(('.dds', '.png')):
+                    fp = os.path.join(ini_dir, f)
+                    if section not in section_textures:
+                        section_textures[section] = []
+                    section_textures[section].append(fp)
+                    break
+    
+    # Also build component-based mapping (for WWMI format)
+    comp_textures = {}
+    for section, texs in section_tex_refs.items():
+        for res_name in texs:
+            fname = resource_files.get(res_name, '')
+            if not fname:
+                continue
+            match = _re.search(r'Components-([0-9-]+)', fname)
+            if match:
+                for comp_str in match.group(1).split('-'):
+                    try:
+                        comp_num = int(comp_str)
+                        if comp_num not in comp_textures:
+                            comp_textures[comp_num] = []
+                        res_data = _resolve_lookup(resolved, res_name)
+                        if res_data and res_data.get('path'):
+                            comp_textures[comp_num].append(res_data['path'])
+                    except:
+                        pass
+    
+    # Merge: for sections with Component in name, use comp_textures
+    for section in list(section_textures.keys()):
+        match = _re.search(r'Component(d+)', section)
+        if match:
+            comp_num = int(match.group(1))
+            if comp_num in comp_textures and comp_textures[comp_num]:
+                section_textures[section] = comp_textures[comp_num]
+    
+    return section_textures
+
 
 def parse_ini_full(ini_path):
     """Parse INI with section/IB/run resolution."""
@@ -91,7 +291,7 @@ def parse_ini_full(ini_path):
         if s.startswith('[') and s.endswith(']'):
             current_section = s[1:-1]
             if current_section not in sections:
-                sections[current_section] = {'ib': None, 'vb0': None, 'vb1': None, 'draws': [], 'runs': [], 'textures': {}}
+                sections[current_section] = {'ib': None, 'vb0': None, 'vb1': None, 'vb2': None, 'draws': [], 'runs': [], 'textures': {}}
             continue
         if not current_section:
             continue
@@ -130,11 +330,19 @@ def parse_ini_full(ini_path):
             sections[current_section]['vb0'] = val
         if key == 'vb1':
             sections[current_section]['vb1'] = val
+        if key == 'vb2':
+            sections[current_section]['vb2'] = val
         if key == 'run':
             sections[current_section]['runs'].append(val)
 
-        # Capture texture references: Resource\ZZMI\Diffuse = ref ResourceXXX
-        if 'diffuse' in key.lower() and val.lower().startswith('ref '):
+        # Capture texture references (multiple formats)
+        if key.startswith('ps-t0') and val.lower().startswith('resource'):
+            sections[current_section]['textures']['diffuse'] = val
+        elif key.startswith('ps-t1') and val.lower().startswith('resource'):
+            sections[current_section]['textures']['lightmap'] = val
+        elif key == 'this' and val.lower().startswith('resource'):
+            sections[current_section]['textures']['this'] = val
+        elif 'diffuse' in key.lower() and val.lower().startswith('ref '):
             ref_name = val[4:].strip()
             sections[current_section]['textures']['diffuse'] = ref_name
         elif 'normalmap' in key.lower() and val.lower().startswith('ref '):
@@ -166,6 +374,10 @@ def parse_ini_full(ini_path):
 
                 variant = current_condition if current_condition and current_condition != 'else' else None
 
+                # Skip zero-count draw calls (placeholders)
+                if is_indexed and count == 0:
+                    continue
+
                 if is_indexed:
                     sections[current_section]['draws'].append({
                         'name': name, 'section': current_section,
@@ -181,22 +393,40 @@ def parse_ini_full(ini_path):
                         'condition': variant,
                     })
 
-    # Resolve IB/VB/texture inheritance via run = calls
+    # First pass: collect IB/VB from all sections (including command lists)
+    section_res = {}  # section_name -> {ib, vb0, vb1, vb2}
+    for sec_name, sec_data in sections.items():
+        section_res[sec_name] = {
+            'ib': sec_data['ib'],
+            'vb0': sec_data['vb0'],
+            'vb1': sec_data['vb1'],
+            'vb2': sec_data.get('vb2'),
+        }
+
+    # Second pass: resolve run = chains (command list -> caller)
     caller_ctx = {}
     for sec_name, sec_data in sections.items():
         ctx = {
             'ib': sec_data['ib'],
             'vb0': sec_data['vb0'],
             'vb1': sec_data['vb1'],
+            'vb2': sec_data.get('vb2'),
             'textures': sec_data['textures'].copy(),
         }
         for run_target in sec_data['runs']:
             if run_target in sections:
-                caller_ctx[run_target] = ctx
-                if sections[run_target]['runs']:
-                    for rt2 in sections[run_target]['runs']:
-                        if rt2 in sections:
-                            caller_ctx[rt2] = ctx
+                # Inherit IB/VB from the command list
+                cmd_res = section_res.get(run_target, {})
+                if cmd_res.get('ib') and not ctx.get('ib'):
+                    ctx['ib'] = cmd_res['ib']
+                if cmd_res.get('vb0') and not ctx.get('vb0'):
+                    ctx['vb0'] = cmd_res['vb0']
+                if cmd_res.get('vb1') and not ctx.get('vb1'):
+                    ctx['vb1'] = cmd_res['vb1']
+                if cmd_res.get('vb2') and not ctx.get('vb2'):
+                    ctx['vb2'] = cmd_res['vb2']
+        # Store context for THIS section (not the target)
+        caller_ctx[sec_name] = ctx
 
     # Build final draw calls
     draw_calls = []
@@ -208,12 +438,14 @@ def parse_ini_full(ini_path):
         eff_ib = sec_data['ib'] if sec_data['ib'] is not None else ctx.get('ib')
         eff_vb0 = sec_data['vb0'] if sec_data['vb0'] is not None else ctx.get('vb0')
         eff_vb1 = sec_data['vb1'] if sec_data['vb1'] is not None else ctx.get('vb1')
+        eff_vb2 = sec_data.get('vb2') or ctx.get('vb2')
         eff_tex = {**ctx.get('textures', {}), **sec_data['textures']}
 
         for dc in sec_data['draws']:
             dc['ib_resource'] = eff_ib
             dc['vb0_resource'] = eff_vb0
             dc['vb1_resource'] = eff_vb1
+            dc['vb2_resource'] = eff_vb2
             dc['textures'] = eff_tex.copy()
             # Propagate condition if not already set
             if 'condition' not in dc:
@@ -229,9 +461,8 @@ def parse_ini_full(ini_path):
 
 def resolve_resources(ini_dir, resources):
     """Resolve all resource files by full relative path, with fallback to filename search."""
-    # Build index: full relative path -> full path
-    all_files_rel = {}  # relative path (with forward slashes) -> absolute path
-    all_files_name = {}  # filename only -> absolute path (first found)
+    all_files_rel = {}
+    all_files_name = {}
     for root, dirs, files in os.walk(ini_dir):
         for f in files:
             fp = os.path.join(root, f)
@@ -241,6 +472,12 @@ def resolve_resources(ini_dir, resources):
             if f not in all_files_name:
                 all_files_name[f] = fp
     
+    print(f"  [Migoto] resolve_resources: {len(set(all_files_rel.values()))} files in {ini_dir}")
+    # Show all .buf files found
+    for f in sorted(all_files_name.keys()):
+        if f.endswith('.buf'):
+            print(f"    Found: {f}")
+    
     resolved = {}
     for rname, rdata in resources.items():
         if 'filename' not in rdata:
@@ -249,18 +486,21 @@ def resolve_resources(ini_dir, resources):
         fname = rdata['filename'].replace('\\', '/')
         fp = None
         
-        # Try 1: exact relative path from ini_dir
         candidate = os.path.join(ini_dir, fname)
         if os.path.exists(candidate):
             fp = candidate
-        # Try 2: search by full relative path
         elif fname in all_files_rel:
             fp = all_files_rel[fname]
         elif fname.lower() in all_files_rel:
             fp = all_files_rel[fname.lower()]
-        # Try 3: search by filename only (last resort)
         elif os.path.basename(fname) in all_files_name:
             fp = all_files_name[os.path.basename(fname)]
+        else:
+            basename_lower = os.path.basename(fname).lower()
+            for af_name, af_path in all_files_name.items():
+                if af_name.lower() == basename_lower:
+                    fp = af_path
+                    break
         
         if fp and os.path.exists(fp):
             resolved[rname] = {
@@ -269,64 +509,94 @@ def resolve_resources(ini_dir, resources):
                 'format': rdata.get('format', ''),
                 'type': rdata.get('type', ''),
             }
+        else:
+            # Debug: show what we tried
+            if 'Buffer' in rname or 'Index' in rname:
+                print(f"    NOT FOUND: {rname} -> {fname}")
+                print(f"      candidate={candidate} exists={os.path.exists(candidate)}")
     
     return resolved
 
 
-def load_mesh_data(resolved, draw_calls, rotate=True, mirror_x=False):
-    """Load vertex/UV/index data per IB, auto-matching VB resources by name prefix."""
-    # Find unique IBs
+def load_mesh_data(resolved, draw_calls, mirror_x=False, mirror_y=False, mirror_z=False, rot_x=0, rot_y=0, rot_z=0, uv_format="auto"):
+    """Load vertex/UV/index data per IB."""
+    # Find unique IBs and their associated VB resources
     ib_set = set()
+    ib_vb_map = {}  # ib_name -> {vb0, vb1, vb2} from draw calls
     for dc in draw_calls:
         ib = dc.get('ib_resource')
         if ib:
             ib_set.add(ib)
+            if ib not in ib_vb_map:
+                ib_vb_map[ib] = {
+                    'vb0': dc.get('vb0_resource'),
+                    'vb1': dc.get('vb1_resource'),
+                    'vb2': dc.get('vb2_resource'),
+                }
 
     mesh_data = {}
 
     for ib_name in ib_set:
-        if ib_name not in resolved:
+        if not _resolve_lookup(resolved, ib_name):
             continue
 
         indices = read_indices(resolved[ib_name]['path'])
 
-        # Extract hash/prefix from IB name to match VB resources
-        # Handles both formats:
-        #   Hash: Resource_b3c6ea5a_Component1 -> b3c6ea5a
-        #   Named: ResourceSunnaBodyAIB -> SunnaBody
-        ib_clean = ib_name.replace('Resource', '').replace('_', '')
-        import re as _re
-        hash_match = _re.search(r'[0-9a-f]{8}', ib_clean.lower())
-        if hash_match:
-            ib_hash = hash_match.group()
-        else:
-            # Named format: strip suffixes
-            ib_hash = ib_clean
-            for suffix in ['AIB', 'BIB', 'IB', 'Component1', 'Component2', 'Component3']:
-                ib_hash = ib_hash.replace(suffix, '')
-            ib_hash = ib_hash.lower()
+        # Try explicit VB resources from draw calls first (WWMI format)
+        vb_info = ib_vb_map.get(ib_name, {})
+        pos_res = vb_info.get('vb0')
+        uv_res = vb_info.get('vb2') or vb_info.get('vb1')  # WWMI uses vb2 for texcoord
 
-        pos_res = None
-        uv_res = None
+        # Fall back to hash/prefix matching (3Dmigoto format)
+        if not pos_res or pos_res not in resolved:
+            ib_clean = ib_name.replace('Resource', '').replace('_', '')
+            import re as _re
+            hash_match = _re.search(r'[0-9a-f]{8}', ib_clean.lower())
+            if hash_match:
+                ib_hash = hash_match.group()
+            else:
+                ib_hash = ib_clean
+                for suffix in ['AIB', 'BIB', 'IB', 'Component1', 'Component2', 'Component3', 'CS']:
+                    ib_hash = ib_hash.replace(suffix, '')
+                ib_hash = ib_hash.lower()
 
-        for rname in resolved:
-            rlower = rname.lower()
-            if 'position' in rlower:
-                if ib_hash and ib_hash in rlower.replace('_', ''):
-                    pos_res = rname
-            elif 'texcoord' in rlower:
-                if ib_hash and ib_hash in rlower.replace('_', ''):
-                    uv_res = rname
+            pos_res = None
+            uv_res = None
+            mesh_parts = ['head', 'body', 'dress', 'hair', 'face', 'arm', 'leg', 'foot', 'hand', 'tail', 'hat', 'skirt', 'heel']
+            
+            # Try matching with progressively shorter prefixes
+            search_key = ib_hash
+            for _ in range(3):
+                for rname in resolved:
+                    rlower = rname.lower().replace('_', '')
+                    if 'position' in rlower or 'texcoord' in rlower:
+                        # Extract the component prefix from resource name
+                        r_clean = rname.replace('Resource', '').replace('Position', '').replace('Texcoord', '').replace('CS', '').replace('_', '').lower()
+                        # Check if IB prefix matches resource prefix
+                        if search_key and r_clean.startswith(search_key):
+                            if 'position' in rlower:
+                                pos_res = rname
+                            else:
+                                uv_res = rname
+                if pos_res and uv_res:
+                    break
+                # Strip mesh part and retry
+                for part in sorted(mesh_parts, key=len, reverse=True):
+                    if search_key.endswith(part) and len(search_key) > len(part):
+                        search_key = search_key[:-len(part)]
+                        break
+                else:
+                    break
 
         positions = []
-        if pos_res and pos_res in resolved:
-            r = resolved[pos_res]
-            positions = read_positions(r['path'], r['stride'], rotate=rotate, mirror_x=mirror_x)
+        if pos_res and _resolve_lookup(resolved, pos_res):
+            r = _resolve_lookup(resolved, pos_res)
+            positions = read_positions(r['path'], r['stride'], mirror_x=mirror_x, mirror_y=mirror_y, mirror_z=mirror_z, rot_x=rot_x, rot_y=rot_y, rot_z=rot_z)
 
         uvs = []
-        if uv_res and uv_res in resolved:
-            r = resolved[uv_res]
-            uvs = read_uvs(r['path'], r['stride'])
+        if uv_res and _resolve_lookup(resolved, uv_res):
+            r = _resolve_lookup(resolved, uv_res)
+            uvs = read_uvs(r['path'], r['stride'], uv_format=uv_format)
 
         mesh_data[ib_name] = {
             'positions': positions,
@@ -381,46 +651,49 @@ def find_textures(ini_dir, resources, resolved):
 
 
 def load_dds(filepath, name):
-    """Load texture into Blender."""
-    print(f"  [Migoto] load_dds: {name} -> {filepath}")
+    """Load texture into Blender. Let Blender handle DDS natively."""
     if not filepath:
-        print(f"  [Migoto]   ERROR: filepath is None")
         return None
     if not os.path.exists(filepath):
-        print(f"  [Migoto]   ERROR: file does not exist")
         return None
     if name in bpy.data.images:
-        print(f"  [Migoto]   Already loaded")
         return bpy.data.images[name]
     
-    # Try 1: direct load
+    # For non-DDS files, load directly
+    if not filepath.lower().endswith('.dds'):
+        try:
+            img = bpy.data.images.load(filepath)
+            img.name = name
+            return img
+        except:
+            return None
+    
+    # For DDS files: try Blender's native DDS loader first
     try:
         img = bpy.data.images.load(filepath)
         img.name = name
-        print(f"  [Migoto]   OK (direct)")
+        # Set color space for diffuse textures
+        if 'Diffuse' in name or 'diffuse' in name:
+            img.colorspace_settings.name = 'sRGB'
+        else:
+            img.colorspace_settings.name = 'Non-Color'
         return img
     except Exception as e:
-        print(f"  [Migoto]   Direct failed: {e}")
+        print(f"  [Migoto] Blender DDS load failed: {os.path.basename(filepath)}: {e}")
     
-    # Try 2: convert DDS->PNG via Pillow
-    if filepath.lower().endswith('.dds'):
-        try:
-            from PIL import Image as PILImage
-            png_path = filepath.rsplit('.', 1)[0] + '.png'
-            if not os.path.exists(png_path):
-                PILImage.open(filepath).save(png_path)
-                print(f"  [Migoto]   Converted to: {png_path}")
-            img = bpy.data.images.load(png_path)
-            img.name = name
-            print(f"  [Migoto]   OK (converted)")
-            return img
-        except ImportError:
-            print(f"  [Migoto]   Pillow not available")
-        except Exception as e:
-            print(f"  [Migoto]   Convert failed: {e}")
-    
-    print(f"  [Migoto]   FAILED")
-    return None
+    # Fallback: convert DDS to PNG via Pillow (only if Blender can't load)
+    try:
+        from PIL import Image as PILImage
+        import tempfile
+        temp_dir = tempfile.mkdtemp(prefix='migoto_tex_')
+        png_name = os.path.splitext(os.path.basename(filepath))[0] + '.png'
+        png_path = os.path.join(temp_dir, png_name)
+        PILImage.open(filepath).save(png_path)
+        img = bpy.data.images.load(png_path)
+        img.name = name
+        return img
+    except:
+        return None
 
 
 # ============================================================
@@ -525,12 +798,30 @@ class IMPORT_OT_3dmigoto(bpy.types.Operator, ImportHelper):
     bl_idname = "import_scene.migoto_model"
     bl_label = "导入 3Dmigoto 模型 / Import 3Dmigoto Model"
     bl_options = {'REGISTER', 'UNDO'}
-    filename_ext = ".ini"
-    filter_glob: StringProperty(default="*.ini", options={'HIDDEN'})
-    rotate_model: BoolProperty(name="应用 -90° X 旋转 / Apply -90° X Rotation", default=True)
-    mirror_x: BoolProperty(name="镜像 X 轴 / Mirror X Axis", description="左右翻转模型 / Flip model left-right", default=False)
+    filename_ext = ".ini;.zip;.rar;.7z"
+    filter_glob: StringProperty(default="*.ini;*.zip;*.rar;*.7z", options={'HIDDEN'})
+    mirror_x: BoolProperty(name="镜像 X 轴 / Mirror X", default=False)
+    mirror_y: BoolProperty(name="镜像 Y 轴 / Mirror Y", default=False)
+    mirror_z: BoolProperty(name="镜像 Z 轴 / Mirror Z", default=False)
+    rot_x: bpy.props.FloatProperty(name="X 旋转 / Rotate X", default=0, min=-360, max=360, step=10, subtype='ANGLE', unit='ROTATION')
+    rot_y: bpy.props.FloatProperty(name="Y 旋转 / Rotate Y", default=0, min=-360, max=360, step=10, subtype='ANGLE', unit='ROTATION')
+    rot_z: bpy.props.FloatProperty(name="Z 旋转 / Rotate Z", default=0, min=-360, max=360, step=10, subtype='ANGLE', unit='ROTATION')
     split_parts: BoolProperty(name="分离部件 / Split Into Parts", default=True)
     load_textures: BoolProperty(name="加载贴图 / Load Textures", default=True)
+    uv_format: bpy.props.EnumProperty(
+        name="UV 格式 / UV Format",
+        items=[
+            ('auto', '自动检测 / Auto', '自动检测UV格式'),
+            ('hf0', 'Half-float @0', ''),
+            ('hf4', 'Half-float @4', ''),
+            ('u16_0', 'uint16 @0', ''),
+            ('u16_2', 'uint16 @2', ''),
+            ('u16_4', 'uint16 @4', ''),
+            ('f32_4', 'float32 @4', ''),
+            ('f32_0', 'float32 @0', ''),
+        ],
+        default='auto',
+    )
 
     def execute(self, context):
         try:
@@ -543,6 +834,51 @@ class IMPORT_OT_3dmigoto(bpy.types.Operator, ImportHelper):
 
     def _run(self, context):
         ini_path = self.filepath
+        
+        # Handle archive files (ZIP/RAR/7z)
+        if ini_path.lower().endswith(('.zip', '.rar', '.7z')):
+            import tempfile
+            extract_dir = tempfile.mkdtemp(prefix='migoto_')
+            print(f"  [Migoto] Extracting archive to: {extract_dir}")
+            
+            if ini_path.lower().endswith('.zip'):
+                import zipfile
+                with zipfile.ZipFile(ini_path, 'r') as zf:
+                    zf.extractall(extract_dir)
+            elif ini_path.lower().endswith('.rar'):
+                try:
+                    import rarfile
+                    with rarfile.RarFile(ini_path, 'r') as rf:
+                        rf.extractall(extract_dir)
+                except Exception as e:
+                    self.report({'ERROR'}, f'Cannot extract RAR: {e}. Install unrar or extract manually.')
+                    return {'CANCELLED'}
+            elif ini_path.lower().endswith('.7z'):
+                try:
+                    import py7zr
+                    with py7zr.SevenZipFile(ini_path, 'r') as sz:
+                        sz.extractall(extract_dir)
+                except Exception as e:
+                    self.report({'ERROR'}, f'Cannot extract 7z: {e}. Install py7zr or extract manually.')
+                    return {'CANCELLED'}
+            
+            # Find INI file in extracted content
+            ini_found = None
+            for root, dirs, files in os.walk(extract_dir):
+                for f in files:
+                    if f.lower().endswith('.ini'):
+                        ini_found = os.path.join(root, f)
+                        break
+                if ini_found:
+                    break
+            
+            if not ini_found:
+                self.report({'ERROR'}, 'No .ini file found in archive')
+                return {'CANCELLED'}
+            
+            ini_path = ini_found
+            print(f"  [Migoto] Found INI: {ini_path}")
+        
         ini_dir = os.path.dirname(ini_path)
 
         # Find mod root: INI might be in a subdirectory (e.g. resources/)
@@ -569,70 +905,88 @@ class IMPORT_OT_3dmigoto(bpy.types.Operator, ImportHelper):
         if not resolved:
             resolved = {}
 
-        # Load mesh data per IB
-        mesh_data = load_mesh_data(resolved, draw_calls, rotate=self.rotate_model, mirror_x=self.mirror_x)
+        print(f"  [Migoto] Resources resolved: {len(resolved)}, Draw calls: {len(draw_calls)}")
+        # Debug: show IB/VB buffer resources
+        ib_names = set(dc.get('ib_resource') for dc in draw_calls if dc.get('ib_resource'))
+        vb0_names = set(dc.get('vb0_resource') for dc in draw_calls if dc.get('vb0_resource'))
+        vb2_names = set(dc.get('vb2_resource') for dc in draw_calls if dc.get('vb2_resource'))
+        for name in ib_names | vb0_names | vb2_names:
+            if name in resolved:
+                print(f"    {name} -> {resolved[name]['path']}")
+            else:
+                print(f"    {name} -> NOT FOUND")
 
-        # Build material map: IB -> diffuse texture path
-        ib_textures = {}  # ib_resource_name -> diffuse file path
+        # Load mesh data per IB
+        mesh_data = load_mesh_data(resolved, draw_calls, mirror_x=self.mirror_x, mirror_y=self.mirror_y, mirror_z=self.mirror_z, rot_x=self.rot_x, rot_y=self.rot_y, rot_z=self.rot_z, uv_format=self.uv_format)
+
+        print(f"  [Migoto] Mesh data loaded: {len(mesh_data)} IBs")
+
+        # Build component texture map from INI
+        comp_textures = build_component_texture_map(ini_path, ini_dir, resolved)
+        if comp_textures:
+            print(f"  [Migoto] Component texture map: {len(comp_textures)} components")
+            for comp, texs in sorted(comp_textures.items()):
+                print(f"    Component {comp}: {len(texs)} textures")
+
+        # Build section -> texture mapping using component numbers
+        import re as _re
+        section_textures = {}  # section_name -> texture_path
+        for dc in draw_calls:
+            sec = dc.get('section', '')
+            if sec in section_textures:
+                continue
+            # Extract component number from section name
+            match = _re.search(r'Component(d+)', sec)
+            if match:
+                comp_num = int(match.group(1))
+                texs = comp_textures.get(comp_num, [])
+                if texs:
+                    section_textures[sec] = texs[0]  # Use first texture as default
+                    # Store all textures for this section (for variant switching)
+                    dc['_all_textures'] = texs
+
+        # Fallback: use ib_textures if no component mapping found
+        ib_textures = {}
         for dc in draw_calls:
             ib = dc.get('ib_resource')
             if not ib or ib in ib_textures:
                 continue
-            tex_ref = dc.get('textures', {}).get('diffuse')
-            if tex_ref and tex_ref in resolved:
-                ib_textures[ib] = resolved[tex_ref]['path']
-                print(f"  [Migoto] {ib} -> {tex_ref} -> {resolved[tex_ref]['path']}")
+            tex_ref = dc.get('textures', {}).get('diffuse') or dc.get('textures', {}).get('this')
+            if tex_ref and _resolve_lookup(resolved, tex_ref):
+                ib_textures[ib] = _resolve_lookup(resolved, tex_ref)['path']
             else:
                 ib_textures[ib] = None
 
-        # Fallback: if no texture refs found, scan directories
-        if all(v is None for v in ib_textures.values()):
-            print(f"  [Migoto] No INI texture refs found, scanning directories...")
-            # Build file index
-            tex_files = {}  # relative_path -> absolute_path
+        if not section_textures and all(v is None for v in ib_textures.values()):
+            print(f"  [Migoto] No texture refs found, scanning...")
+            tex_files = {}
             for sdir in search_dirs:
                 for root, dirs, files in os.walk(sdir):
+                    depth = root.replace(sdir, '').count(os.sep)
+                    if depth > 2:
+                        dirs.clear()
+                        continue
                     for f in files:
                         if f.lower().endswith(('.dds', '.png', '.jpg')):
                             fp = os.path.join(root, f)
                             rel = os.path.relpath(fp, sdir).replace('\\', '/').lower()
                             tex_files[rel] = fp
-            
-            # Match by IB name -> directory pattern
+
             for ib in ib_textures:
                 ib_lower = ib.lower()
                 best = None
                 for rel, fp in tex_files.items():
                     rel_lower = rel.lower()
-                    # Skip non-color textures
                     if any(skip in rel_lower for skip in ['normal', 'lightmap', 'materialmap', 'fx', 'wengine', 'toggle', 'menu', 'slot']):
                         continue
-                    # Body IB -> textures/body/ directory
-                    if 'body' in ib_lower and 'body' in rel_lower:
-                        best = fp
-                        break
-                    # Hair IB -> textures/hair/ or resources/ with hair
-                    elif 'hair' in ib_lower and ('hair' in rel_lower or 'head' in rel_lower):
-                        best = fp
-                        break
-                
-                # Fallback: first valid texture
-                if not best:
-                    for rel, fp in tex_files.items():
-                        rel_lower = rel.lower()
-                        if any(skip in rel_lower for skip in ['normal', 'lightmap', 'materialmap', 'fx', 'wengine', 'toggle', 'menu', 'slot']):
-                            continue
-                        best = fp
-                        break
-                
+                    best = fp
+                    break
                 ib_textures[ib] = best
                 if best:
-                    print(f"  [Migoto] {ib} -> auto: {best}")
-                else:
-                    print(f"  [Migoto] {ib} -> no texture found")
+                    print(f"  [Migoto] {ib} -> auto: {os.path.basename(best)}")
 
-        # Use mod root for collection path
-        mod_root = search_dirs[-1]
+        # Use INI directory (not parent dirs) for texture scanning
+        mod_root = ini_dir
         
         # Create collection
         mod_name = safe_name(os.path.splitext(os.path.basename(ini_path))[0])
@@ -640,22 +994,33 @@ class IMPORT_OT_3dmigoto(bpy.types.Operator, ImportHelper):
         coll['migoto_ini_dir'] = mod_root
         context.scene.collection.children.link(coll)
 
-        # Create materials per IB
+        # Create materials per draw call section
         materials = {}
-        for ib_name, tex_path in ib_textures.items():
-            mat_name = f"{mod_name}_{ib_name.replace('Resource', '').replace('AIB', '').replace('BIB', '').replace('IB', '')}"
-            is_hair = 'hair' in ib_name.lower()
-            materials[ib_name] = make_material(mat_name, diffuse=tex_path, alpha=is_hair)
+        for dc in draw_calls:
+            sec = dc.get('section', '')
+            if sec in materials:
+                continue
+            # Use section texture (from component mapping) or ib texture fallback
+            tex_path = section_textures.get(sec)
+            if not tex_path:
+                ib = dc.get('ib_resource', '')
+                tex_path = ib_textures.get(ib)
+            mat_name = f"{mod_name}_{safe_name(sec)}"
+            is_hair = 'hair' in sec.lower()
+            materials[sec] = make_material(mat_name, diffuse=tex_path, alpha=is_hair)
+            if tex_path:
+                print(f"  [Migoto] Material {mat_name} -> {os.path.basename(tex_path)}")
 
         obj_count = 0
+        print(f"  [Migoto] Creating meshes...")
 
         if self.split_parts:
             for dc in draw_calls:
                 ib = dc.get('ib_resource')
-                if not ib or ib not in mesh_data:
+                if not ib or not _resolve_lookup(mesh_data, ib):
                     continue
 
-                md = mesh_data[ib]
+                md = _resolve_lookup(mesh_data, ib)
                 positions = md['positions']
                 uvs = md['uvs']
                 indices = md['indices']
@@ -674,7 +1039,7 @@ class IMPORT_OT_3dmigoto(bpy.types.Operator, ImportHelper):
                     continue
 
                 # Material from IB
-                mat = materials.get(dc.get('ib_resource'))
+                mat = materials.get(dc.get('section'))
 
                 obj, cnt = build_object(dc['name'], positions, uvs, tris, mat, coll)
                 if cnt > 0:
@@ -693,9 +1058,9 @@ class IMPORT_OT_3dmigoto(bpy.types.Operator, ImportHelper):
                 ib_groups[ib].append(dc)
 
             for ib, draws in ib_groups.items():
-                if not ib or ib not in mesh_data:
+                if not ib or not _resolve_lookup(mesh_data, ib):
                     continue
-                md = mesh_data[ib]
+                md = _resolve_lookup(mesh_data, ib)
                 positions = md['positions']
                 uvs = md['uvs']
                 indices = md['indices']
@@ -714,33 +1079,6 @@ class IMPORT_OT_3dmigoto(bpy.types.Operator, ImportHelper):
                     if cnt > 0:
                         obj_count += 1
 
-        # Set up variant visibility
-        # Group objects by condition, hide non-first variants
-        variant_conditions = set()
-        for dc in draw_calls:
-            cond = dc.get('condition')
-            if cond:
-                variant_conditions.add(cond)
-
-        if variant_conditions:
-            # Sort conditions for consistent ordering
-            sorted_conditions = sorted(variant_conditions)
-            first_cond = sorted_conditions[0]
-
-            # Store variant info on collection
-            coll['migoto_variant_var'] = '$swapkey0'  # TODO: detect variable name
-            coll['migoto_variant_conditions'] = '\n'.join(sorted_conditions)
-
-            # Tag and hide objects
-            for obj in coll.objects:
-                if obj.type != 'MESH':
-                    continue
-                # Find which condition this object belongs to
-                obj_cond = obj.get('migoto_condition', None)
-                if obj_cond:
-                    obj.hide_viewport = (obj_cond != first_cond)
-                    obj.hide_render = (obj_cond != first_cond)
-
         self.report({'INFO'}, f"导入 {obj_count} 个对象 / Imported {obj_count} objects")
         return {'FINISHED'}
 
@@ -753,181 +1091,182 @@ def menu_fn(self, context):
 # Variant Texture Switcher UI
 # ============================================================
 
-class MIGOTO_PG_variant(bpy.types.PropertyGroup):
-    """Store a texture variant option."""
-    name: bpy.props.StringProperty(name="名称 / Name")
-    filepath: bpy.props.StringProperty(name="路径 / File Path")
+class MIGOTO_PG_texture_item(bpy.types.PropertyGroup):
+    """贴图列表条目 / Texture list item"""
+    name: bpy.props.StringProperty(name="Name")
+    filepath: bpy.props.StringProperty(name="Path")
+    category: bpy.props.StringProperty(name="Category")
+    preview_icon: bpy.props.IntProperty(name="Preview Icon", default=0)
 
 
-class MIGOTO_PG_material_variants(bpy.types.PropertyGroup):
-    """Store all variants for one material slot."""
-    material_name: bpy.props.StringProperty(name="材质 / Material")
-    current_index: bpy.props.IntProperty(name="当前 / Current", default=0)
-    variants: bpy.props.CollectionProperty(type=MIGOTO_PG_variant)
-
-
-class MIGOTO_PG_model_variants(bpy.types.PropertyGroup):
-    """Top-level storage for all material variants in the imported model."""
-    model_name: bpy.props.StringProperty(name="模型 / Model")
-    materials: bpy.props.CollectionProperty(type=MIGOTO_PG_material_variants)
-    active_material: bpy.props.IntProperty(name="激活 / Active", default=0)
-
-
-class MIGOTO_OT_switch_variant(bpy.types.Operator):
-    """Switch texture variant for a material"""
-    bl_idname = "migoto.switch_variant"
-    bl_label = "切换变体 / Switch Variant"
+class MIGOTO_OT_load_textures(bpy.types.Operator):
+    """扫描目录加载贴图列表 / Scan directory for textures"""
+    bl_idname = "migoto.load_textures"
+    bl_label = "加载贴图列表 / Load Textures"
     bl_options = {'REGISTER', 'UNDO'}
-
-    material_index: bpy.props.IntProperty()
-    variant_index: bpy.props.IntProperty()
 
     def execute(self, context):
         scene = context.scene
-        if not hasattr(scene, 'migoto_variants'):
+
+        # Find mod directory
+        mod_dir = None
+        for coll in bpy.data.collections:
+            if 'migoto_ini_dir' in coll:
+                mod_dir = coll['migoto_ini_dir']
+                break
+
+        if not mod_dir or not os.path.isdir(mod_dir):
+            self.report({'ERROR'}, '未找到模型目录')
             return {'CANCELLED'}
 
-        model_var = scene.migoto_variants
-        if self.material_index >= len(model_var.materials):
-            return {'CANCELLED'}
+        if not hasattr(scene, 'migoto_textures'):
+            scene.migoto_textures = bpy.props.CollectionProperty(type=MIGOTO_PG_texture_item)
+        scene.migoto_textures.clear()
 
-        mat_var = model_var.materials[self.material_index]
-        if self.variant_index >= len(mat_var.variants):
-            return {'CANCELLED'}
+        # Clear old preview collection
+        if 'default' in _preview_collections:
+            bpy.utils.previews.remove(_preview_collections['default'])
+        _preview_collections['default'] = bpy.utils.previews.new()
+        pcoll = _preview_collections['default']
 
-        variant = mat_var.variants[self.variant_index]
-        mat_var.current_index = self.variant_index
+        # Scan mod directory + one level of subdirectories
+        tex_files = []
+        for f in os.listdir(mod_dir):
+            fp = os.path.join(mod_dir, f)
+            if os.path.isfile(fp) and f.lower().endswith(('.dds', '.png', '.jpg')):
+                tex_files.append((fp, 'root'))
+        for entry in os.listdir(mod_dir):
+            sub = os.path.join(mod_dir, entry)
+            if not os.path.isdir(sub):
+                continue
+            for f in os.listdir(sub):
+                fp = os.path.join(sub, f)
+                if os.path.isfile(fp) and f.lower().endswith(('.dds', '.png', '.jpg')):
+                    tex_files.append((fp, entry))
 
-        # Find the material and update its texture
-        mat_name = mat_var.material_name
-        if mat_name not in bpy.data.materials:
-            return {'CANCELLED'}
+        # Load previews
+        for fp, category in tex_files:
+            item = scene.migoto_textures.add()
+            item.name = os.path.splitext(os.path.basename(fp))[0]
+            item.filepath = fp
+            item.category = category
 
-        mat = bpy.data.materials[mat_name]
-        if not mat.use_nodes:
-            return {'CANCELLED'}
+            # Load preview icon
+            load_fp = fp
+            # For DDS, try to load directly; if preview fails, convert to temp PNG
+            preview_loaded = False
+            try:
+                preview = pcoll.load(fp, fp, 'IMAGE')
+                item.preview_icon = preview.icon_id
+                preview_loaded = True
+            except:
+                pass
+            
+            if not preview_loaded and fp.lower().endswith('.dds'):
+                try:
+                    from PIL import Image as PILImage
+                    import tempfile
+                    temp_dir = tempfile.mkdtemp(prefix='migoto_tex_')
+                    png_name = os.path.splitext(os.path.basename(fp))[0] + '.png'
+                    png_path = os.path.join(temp_dir, png_name)
+                    if not os.path.exists(png_path):
+                        PILImage.open(fp).save(png_path)
+                    preview = pcoll.load(fp, png_path, 'IMAGE')
+                    item.preview_icon = preview.icon_id
+                except:
+                    item.preview_icon = 0
 
-        # Find the image texture node
-        for node in mat.node_tree.nodes:
-            if node.type == 'TEX_IMAGE':
-                # Load new texture
-                fp = variant.filepath
-                if os.path.exists(fp):
-                    new_img = bpy.data.images.load(fp)
-                    new_img.name = f"{mat_name}_{variant.name}"
-                    node.image = new_img
-                    break
-
+        self.report({'INFO'}, f'加载 {len(scene.migoto_textures)} 张贴图')
         return {'FINISHED'}
 
 
-class MIGOTO_OT_scan_variants(bpy.types.Operator):
-    """Scan imported model directory for texture variants"""
-    bl_idname = "migoto.scan_variants"
-    bl_label = "扫描贴图变体 / Scan Texture Variants"
+class MIGOTO_OT_apply_texture(bpy.types.Operator):
+    """应用贴图到选中对象 / Apply texture to selected object"""
+    bl_idname = "migoto.apply_texture"
+    bl_label = "应用贴图 / Apply Texture"
     bl_options = {'REGISTER', 'UNDO'}
+
+    filepath: bpy.props.StringProperty()
+
+    def execute(self, context):
+        obj = context.active_object
+        if not obj or obj.type != 'MESH':
+            self.report({'ERROR'}, '请先选中一个网格对象')
+            return {'CANCELLED'}
+
+        fp = self.filepath
+        if not os.path.exists(fp):
+            self.report({'ERROR'}, '文件不存在')
+            return {'CANCELLED'}
+
+        # For DDS, convert to temp PNG
+        if fp.lower().endswith('.dds'):
+            try:
+                from PIL import Image as PILImage
+                import tempfile
+                temp_dir = tempfile.mkdtemp(prefix='migoto_tex_')
+                png_name = os.path.splitext(os.path.basename(fp))[0] + '.png'
+                png_path = os.path.join(temp_dir, png_name)
+                PILImage.open(fp).save(png_path)
+                fp = png_path
+            except:
+                pass
+
+        # Load image
+        img_name = os.path.basename(fp)
+        if img_name in bpy.data.images:
+            img = bpy.data.images[img_name]
+        else:
+            img = bpy.data.images.load(fp)
+            img.name = img_name
+
+        # Find or create material
+        mat = obj.active_material
+        if not mat:
+            mat = bpy.data.materials.new(name=obj.name + '_Material')
+            mat.use_nodes = True
+            obj.data.materials.append(mat)
+
+        if not mat.use_nodes:
+            mat.use_nodes = True
+
+        # Find image texture node
+        tex_node = None
+        for node in mat.node_tree.nodes:
+            if node.type == 'TEX_IMAGE':
+                tex_node = node
+                break
+
+        if not tex_node:
+            tex_node = mat.node_tree.nodes.new('ShaderNodeTexImage')
+            tex_node.location = (-300, 0)
+            for node in mat.node_tree.nodes:
+                if node.type == 'BSDF_PRINCIPLED':
+                    mat.node_tree.links.new(tex_node.outputs['Color'], node.inputs['Base Color'])
+                    break
+
+        tex_node.image = img
+
+        self.report({'INFO'}, f'已应用: {img_name}')
+        return {'FINISHED'}
+
+
+class MIGOTO_OT_apply_texture_from_list(bpy.types.Operator):
+    """从列表应用贴图 / Apply texture from list"""
+    bl_idname = "migoto.apply_texture_from_list"
+    bl_label = "Apply"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    index: bpy.props.IntProperty()
 
     def execute(self, context):
         scene = context.scene
-
-        # Find the INI file path from the imported collection
-        # Look for the most recently imported migoto collection
-        ini_path = None
-        for coll in bpy.data.collections:
-            # Check if collection has migoto mesh objects
-            has_mesh = any(obj.type == 'MESH' for obj in coll.objects)
-            if has_mesh:
-                # Try to find INI path from a custom property
-                if 'migoto_ini_dir' in coll:
-                    ini_path = coll['migoto_ini_dir']
-                    break
-
-        if not ini_path or not os.path.isdir(ini_path):
-            self.report({'ERROR'}, 'No imported model found. Import a model first.')
+        if not hasattr(scene, 'migoto_textures') or self.index >= len(scene.migoto_textures):
             return {'CANCELLED'}
+        item = scene.migoto_textures[self.index]
 
-        # Create variant storage
-        if not hasattr(scene, 'migoto_variants'):
-            scene.migoto_variants = bpy.props.PointerProperty(type=MIGOTO_PG_model_variants)
-
-        model_var = scene.migoto_variants
-        model_var.materials.clear()
-
-        # Scan for texture variants in the INI directory
-        texture_groups = {}  # category -> list of (name, filepath)
-
-        for root, dirs, files in os.walk(ini_path):
-            for f in files:
-                if not f.lower().endswith(('.dds', '.png', '.jpg')):
-                    continue
-                fp = os.path.join(root, f)
-                rel = os.path.relpath(fp, ini_path).replace('\\', '/')
-
-                # Categorize by directory
-                parts = rel.split('/')
-                if len(parts) >= 2:
-                    category = parts[-2]  # parent directory name
-                else:
-                    category = 'root'
-
-                name = os.path.splitext(f)[0]
-                if category not in texture_groups:
-                    texture_groups[category] = []
-                texture_groups[category].append((name, fp))
-
-        # Create material variant entries for body textures
-        for category, variants in texture_groups.items():
-            if len(variants) < 2:
-                continue  # Skip single-variant categories
-
-            # Find which material uses this category
-            mat_name = None
-            for mat in bpy.data.materials:
-                if not mat.use_nodes:
-                    continue
-                for node in mat.node_tree.nodes:
-                    if node.type == 'TEX_IMAGE' and node.image:
-                        img_path = bpy.path.abspath(node.image.filepath)
-                        for vname, vpath in variants:
-                            if os.path.normpath(img_path) == os.path.normpath(vpath):
-                                mat_name = mat.name
-                                break
-                    if mat_name:
-                        break
-                if mat_name:
-                    break
-
-            if not mat_name:
-                # Guess material from category
-                cat_lower = category.lower()
-                for mat in bpy.data.materials:
-                    if cat_lower in mat.name.lower():
-                        mat_name = mat.name
-                        break
-
-            if not mat_name:
-                continue
-
-            # Add to variant storage
-            mat_var = model_var.materials.add()
-            mat_var.material_name = mat_name
-            for vname, vpath in sorted(variants):
-                v = mat_var.variants.add()
-                v.name = vname
-                v.filepath = vpath
-
-            # Set current to match loaded texture
-            for i, (_, vpath) in enumerate(sorted(variants)):
-                mat = bpy.data.materials.get(mat_name)
-                if mat and mat.use_nodes:
-                    for node in mat.node_tree.nodes:
-                        if node.type == 'TEX_IMAGE' and node.image:
-                            img_path = bpy.path.abspath(node.image.filepath)
-                            if os.path.normpath(img_path) == os.path.normpath(vpath):
-                                mat_var.current_index = i
-                                break
-
-        self.report({'INFO'}, f'Found {len(model_var.materials)} material variant groups')
+        # Apply directly (load_dds handles DDS conversion to temp)
+        bpy.ops.migoto.apply_texture(filepath=item.filepath)
         return {'FINISHED'}
 
 
@@ -1211,47 +1550,66 @@ class MIGOTO_OT_auto_group(bpy.types.Operator):
             if 'migoto_ini_dir' not in coll:
                 continue
 
-            # Group by condition
-            cond_objects = {}  # condition -> [obj_name, ...]
+            # Parse conditions: extract variable name from conditions like '$booba == 0'
+            var_groups = {}  # var_name -> {value -> [obj_name, ...]}
+            no_cond_objects = []
+
             for obj in coll.objects:
                 if obj.type != 'MESH':
                     continue
                 cond = obj.get('migoto_condition', None)
                 if cond:
-                    if cond not in cond_objects:
-                        cond_objects[cond] = []
-                    cond_objects[cond].append(obj.name)
+                    # Extract variable name: '$booba == 0' -> '$booba'
+                    import re as _re
+                    match = _re.match(r'(\$\w+)\s*==\s*', cond)
+                    if match:
+                        var_name = match.group(1)
+                        value = cond
+                    else:
+                        var_name = 'other'
+                        value = cond
+                    if var_name not in var_groups:
+                        var_groups[var_name] = {}
+                    if value not in var_groups[var_name]:
+                        var_groups[var_name][value] = []
+                    var_groups[var_name][value].append(obj.name)
+                else:
+                    no_cond_objects.append(obj.name)
 
-            if not cond_objects:
-                self.report({'INFO'}, 'No variant conditions found')
+            if not var_groups and not no_cond_objects:
+                self.report({'INFO'}, '未找到变体条件 / No variant conditions found')
                 return {'CANCELLED'}
 
-            # Create one group with all variants
             mg.groups.clear()
-            g = mg.groups.add()
-            g.name = "变体 / Variants"
-            for cond, obj_names in sorted(cond_objects.items()):
-                for oname in obj_names:
+
+            # Create a group for each variable
+            for var_name, values in sorted(var_groups.items()):
+                g = mg.groups.add()
+                g.name = var_name
+                for value, obj_names in sorted(values.items()):
+                    for oname in obj_names:
+                        item = g.items.add()
+                        item.obj_name = oname
+                # Show all by default (not mutually exclusive)
+                for item in g.items:
+                    obj = bpy.data.objects.get(item.obj_name)
+                    if obj:
+                        obj.hide_viewport = False
+                        obj.hide_render = False
+
+            # Group always-visible objects
+            if no_cond_objects:
+                g = mg.groups.add()
+                g.name = '常显 / Always Visible'
+                for oname in no_cond_objects:
                     item = g.items.add()
                     item.obj_name = oname
-            # Hide all but first
-            for i, item in enumerate(g.items):
-                obj = bpy.data.objects.get(item.obj_name)
-                if obj:
-                    obj.hide_viewport = (i != 0)
-                    obj.hide_render = (i != 0)
-            g.active_index = 0
 
-            # Also group always-visible objects separately
-            always_visible = []
-            for obj in coll.objects:
-                if obj.type == 'MESH' and not obj.get('migoto_condition'):
-                    always_visible.append(obj.name)
+            self.report({'INFO'}, f'创建 {len(mg.groups)} 个分组 / Created {len(mg.groups)} groups')
+            return {'FINISHED'}
 
-            break
-
-        self.report({'INFO'}, f'Created {len(mg.groups)} groups')
-        return {'FINISHED'}
+        self.report({'INFO'}, '未找到导入模型 / No imported model found')
+        return {'CANCELLED'}
 
 
 class MIGOTO_PT_mesh_groups(bpy.types.Panel):
@@ -1320,8 +1678,8 @@ class MIGOTO_PT_mesh_groups(bpy.types.Panel):
 
 
 class MIGOTO_PT_panel(bpy.types.Panel):
-    """3Dmigoto Model Variant Panel"""
-    bl_label = "3Dmigoto 变体 / Variants"
+    """3Dmigoto 主面板"""
+    bl_label = "3Dmigoto"
     bl_idname = "MIGOTO_PT_panel"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -1335,44 +1693,88 @@ class MIGOTO_PT_panel(bpy.types.Panel):
         layout.operator('import_scene.migoto_model', text='导入模型 / Import Model', icon='IMPORT')
         layout.separator()
 
-        # Scan variants button
-        layout.operator('migoto.scan_variants', text='扫描变体 / Scan Variants', icon='VIEWZOOM')
-
-        # Export textures button
+        # Export textures
         layout.operator('migoto.export_textures', text='导出贴图 / Export Textures', icon='EXPORT')
         layout.separator()
 
-        # Texture variants
-        if not hasattr(scene, 'migoto_variants'):
-            layout.label(text='未加载变体 / No variants loaded')
-            return
-
-        model_var = scene.migoto_variants
-        if not model_var.materials:
-            layout.label(text='未找到变体 / No variants found')
-            return
-
-        for mat_idx, mat_var in enumerate(model_var.materials):
+        # Texture browser (for selected object)
+        obj = context.active_object
+        if obj and obj.type == 'MESH':
             box = layout.box()
-            box.label(text=mat_var.material_name, icon='MATERIAL')
+            box.label(text=f'贴图浏览器 / Texture Browser', icon='TEXTURE')
+            box.label(text=f'对象: {obj.name}', icon='OBJECT_DATA')
 
-            for var_idx, variant in enumerate(mat_var.variants):
-                row = box.row()
-                is_active = (mat_var.current_index == var_idx)
-                icon = 'RADIOBUT_ON' if is_active else 'RADIOBUT_OFF'
-                op = row.operator('migoto.switch_variant', text=variant.name, icon=icon)
-                op.material_index = mat_idx
-                op.variant_index = var_idx
+            # Current texture
+            if obj.active_material and obj.active_material.use_nodes:
+                for node in obj.active_material.node_tree.nodes:
+                    if node.type == 'TEX_IMAGE' and node.image:
+                        img = node.image
+                        box.label(text=f'当前: {img.name}', icon='IMAGE_DATA')
+                        break
+
+            # Load textures button
+            box.operator('migoto.load_textures', text='加载贴图列表 / Load Textures', icon='FILE_FOLDER')
+
+            # Auto-load if empty and mod_dir exists
+            if not hasattr(scene, 'migoto_textures') or len(scene.migoto_textures) == 0:
+                # Try to auto-load
+                for coll in bpy.data.collections:
+                    if 'migoto_ini_dir' in coll:
+                        mod_dir = coll['migoto_ini_dir']
+                        if os.path.isdir(mod_dir):
+                            box.label(text='提示: 点击上方按钮加载贴图列表', icon='INFO')
+                        break
+                return
+
+            # Show texture list grouped by category
+            categories = {}
+            for i, item in enumerate(scene.migoto_textures):
+                cat = item.category or 'root'
+                if cat not in categories:
+                    categories[cat] = []
+                categories[cat].append((i, item))
+
+            for cat, items in sorted(categories.items()):
+                cat_box = box.box()
+                cat_box.label(text=f'{cat} ({len(items)}张贴图)', icon='FILE_FOLDER')
+
+                for idx, (i, item) in enumerate(items):
+                    row = cat_box.row(align=True)
+
+                    # Small preview icon
+                    if item.preview_icon:
+                        row.label(text='', icon_value=item.preview_icon)
+
+                    # Check if currently applied
+                    is_current = False
+                    if obj.active_material and obj.active_material.use_nodes:
+                        for node in obj.active_material.node_tree.nodes:
+                            if node.type == 'TEX_IMAGE' and node.image:
+                                try:
+                                    img_base = os.path.splitext(os.path.basename(bpy.path.abspath(node.image.filepath)))[0]
+                                    tex_base = os.path.splitext(os.path.basename(item.filepath))[0]
+                                    if img_base == tex_base:
+                                        is_current = True
+                                except:
+                                    pass
+                                break
+
+                    # Click to apply
+                    icon = 'RADIOBUT_ON' if is_current else 'IMAGE_DATA'
+                    op = row.operator('migoto.apply_texture_from_list', text=item.name, icon=icon)
+                    op.index = i
+        else:
+            layout.label(text='请选中一个网格对象')
 
 
 classes = (
-    MIGOTO_PG_variant,
-    MIGOTO_PG_material_variants,
-    MIGOTO_PG_model_variants,
+    MIGOTO_PG_texture_item,
     MIGOTO_PG_mesh_group_item,
     MIGOTO_PG_mesh_group,
     MIGOTO_PG_mesh_groups,
-    MIGOTO_OT_switch_variant,
+    MIGOTO_OT_load_textures,
+    MIGOTO_OT_apply_texture,
+    MIGOTO_OT_apply_texture_from_list,
     MIGOTO_OT_add_group,
     MIGOTO_OT_remove_group,
     MIGOTO_OT_add_obj_to_group,
@@ -1382,7 +1784,6 @@ classes = (
     MIGOTO_OT_hide_all_in_group,
     MIGOTO_OT_rename_group,
     MIGOTO_OT_auto_group,
-    MIGOTO_OT_scan_variants,
     MIGOTO_OT_export_textures,
     MIGOTO_PT_mesh_groups,
     MIGOTO_PT_panel,
@@ -1394,16 +1795,20 @@ def register():
     for cls in classes:
         bpy.utils.register_class(cls)
     bpy.types.TOPBAR_MT_file_import.append(menu_fn)
-    bpy.types.Scene.migoto_variants = bpy.props.PointerProperty(type=MIGOTO_PG_model_variants)
     bpy.types.Scene.migoto_mesh_groups = bpy.props.PointerProperty(type=MIGOTO_PG_mesh_groups)
+    bpy.types.Scene.migoto_textures = bpy.props.CollectionProperty(type=MIGOTO_PG_texture_item)
 
 
 def unregister():
     bpy.types.TOPBAR_MT_file_import.remove(menu_fn)
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
-    del bpy.types.Scene.migoto_variants
     del bpy.types.Scene.migoto_mesh_groups
+    del bpy.types.Scene.migoto_textures
+    # Clean up preview collections
+    for pcoll in _preview_collections.values():
+        bpy.utils.previews.remove(pcoll)
+    _preview_collections.clear()
 
 if __name__ == "__main__":
     register()
