@@ -78,20 +78,53 @@ def read_uvs(filepath, stride, hf_offset=None, uv_format="auto"):
 
     # Manual format selection
     if uv_format != 'auto':
-        fmt_map = {'hf0': ('hf',0), 'hf4': ('hf',4), 'u16_0': ('u16',0), 'u16_2': ('u16',2), 'u16_4': ('u16',4), 'f32_4': ('f32',4), 'f32_0': ('f32',0)}
+        fmt_map = {'hf0': ('hf',0), 'hf4': ('hf',4), 'u16_0': ('u16',0), 'u16_2': ('u16',2), 'u16_4': ('u16',4), 'u16_12': ('u16',12), 'f32_4': ('f32',4), 'f32_0': ('f32',0)}
+        # Endfield split UV: U@0, V@4 (non-contiguous uint16)
+        if uv_format == 'u16_split':
+            print(f"  [Migoto] UV: manual format=u16_split (U@0, V@4)")
+            out = []
+            for i in range(n):
+                try:
+                    u = struct.unpack_from('<H', data, i * stride)[0] / 65535.0
+                    v = struct.unpack_from('<H', data, i * stride + 4)[0] / 65535.0
+                    out.append((u, 1.0 - v))
+                except:
+                    out.append((0.0, 0.0))
+            return out
+        # Endfield VB2 UV: U@0, V@2 (uint16, skip first 9 degenerate vertices)
+        if uv_format == 'ef_vb2':
+            print(f"  [Migoto] UV: manual format=ef_vb2 (U@0, V@2, skip 9)")
+            out = []
+            for i in range(n):
+                try:
+                    if i < 9:
+                        out.append((0.0, 0.0))
+                    else:
+                        u = struct.unpack_from('<H', data, i * stride)[0] / 65535.0
+                        v = struct.unpack_from('<H', data, i * stride + 2)[0] / 65535.0
+                        out.append((u, 1.0 - v))
+                except:
+                    out.append((0.0, 0.0))
+            return out
         if uv_format in fmt_map:
             fmt, off = fmt_map[uv_format]
             print(f"  [Migoto] UV: manual format={fmt}, offset={off}")
             out = []
             for i in range(n):
-                if fmt == 'hf':
-                    u, v = struct.unpack_from('<ee', data, i * stride + off)
-                elif fmt == 'u16':
-                    u16, v16 = struct.unpack_from('<HH', data, i * stride + off)
-                    u, v = u16 / 65535.0, v16 / 65535.0
-                else:
-                    u, v = struct.unpack_from('<2f', data, i * stride + off)
-                out.append((u, 1.0 - v))
+                try:
+                    if off + 4 > stride:
+                        out.append((0.0, 0.0))
+                        continue
+                    if fmt == 'hf':
+                        u, v = struct.unpack_from('<ee', data, i * stride + off)
+                    elif fmt == 'u16':
+                        u16, v16 = struct.unpack_from('<HH', data, i * stride + off)
+                        u, v = u16 / 65535.0, v16 / 65535.0
+                    else:
+                        u, v = struct.unpack_from('<2f', data, i * stride + off)
+                    out.append((u, 1.0 - v))
+                except:
+                    out.append((0.0, 0.0))
             return out
 
     # Auto-detect: test all formats: half-float, uint16 UNORM, float32
@@ -105,11 +138,14 @@ def read_uvs(filepath, stride, hf_offset=None, uv_format="auto"):
     for offset in range(0, min(stride, 20), 4):
         if offset + 8 <= stride:
             candidates.append(('f32', offset))
+    # Non-contiguous UV: U at bytes 0-1, V at bytes 4-5 (Endfield VB2 format, stride 12)
+    if stride == 12:
+        candidates.append(('u16_split', 0))
 
-    best_fmt, best_off, best_score = 'hf', 0, -1
+    # Phase 1: score by [0,1] validity (no coverage penalty - it misleads when UV range is narrow)
+    scored = []  # (score, fmt, off)
     for fmt, off in candidates:
         score = 0
-        u_vals, v_vals = [], []
         sample = min(2000, n)
         for i in range(sample):
             try:
@@ -118,28 +154,69 @@ def read_uvs(filepath, stride, hf_offset=None, uv_format="auto"):
                 elif fmt == 'u16':
                     u16, v16 = struct.unpack_from('<HH', data, i * stride + off)
                     u, v = u16 / 65535.0, v16 / 65535.0
-                else:  # f32
+                elif fmt == 'u16_split':
+                    u = struct.unpack_from('<H', data, i * stride)[0] / 65535.0
+                    v = struct.unpack_from('<H', data, i * stride + 4)[0] / 65535.0
+                else:
                     u, v = struct.unpack_from('<2f', data, i * stride + off)
                 if 0.0 <= u <= 1.0 and 0.0 <= v <= 1.0:
                     score += 1
-                    u_vals.append(u)
-                    v_vals.append(v)
             except:
                 pass
-        # Prefer formats with wide UV coverage (at least one axis > 50%)
-        if len(u_vals) > 10:
-            u_range = max(u_vals) - min(u_vals)
-            v_range = max(v_vals) - min(v_vals)
-            coverage = max(u_range, v_range)  # Best axis coverage
-            # Bonus for both axes having range
-            if u_range > 0.1 and v_range > 0.1:
-                score = int(score * 1.5)
-            # Penalty if both axes are narrow
-            if coverage < 0.3:
-                score = score // 5
-        if score > best_score:
-            best_score, best_fmt, best_off = score, fmt, off
+        scored.append((score, fmt, off))
 
+    # Phase 2: for top candidates, break ties using spatial coherence
+    # Consecutive vertices should have similar UVs for the correct format
+    # Constant data (metadata) also has perfect coherence - skip it
+    scored.sort(key=lambda x: -x[0])
+    best_fmt, best_off = scored[0][1], scored[0][2]
+    if len(scored) > 1 and n > 100:
+        threshold = scored[0][0] * 0.9
+        top = [(s, f, o) for s, f, o in scored if s >= threshold and s > 0]
+        if len(top) > 1:
+            best_coherence = float('inf')
+            check = min(500, n - 1)
+            for _, fmt, off in top:
+                total_dist = 0.0
+                cnt = 0
+                u_sum = v_sum = u_sq = v_sq = 0.0
+                for i in range(check):
+                    try:
+                        if fmt == 'hf':
+                            u0, v0 = struct.unpack_from('<ee', data, i * stride + off)
+                            u1, v1 = struct.unpack_from('<ee', data, (i + 1) * stride + off)
+                        elif fmt == 'u16':
+                            u0 = struct.unpack_from('<H', data, i * stride + off)[0] / 65535.0
+                            v0 = struct.unpack_from('<H', data, i * stride + off + 2)[0] / 65535.0
+                            u1 = struct.unpack_from('<H', data, (i + 1) * stride + off)[0] / 65535.0
+                            v1 = struct.unpack_from('<H', data, (i + 1) * stride + off + 2)[0] / 65535.0
+                        elif fmt == 'u16_split':
+                            u0 = struct.unpack_from('<H', data, i * stride)[0] / 65535.0
+                            v0 = struct.unpack_from('<H', data, i * stride + 4)[0] / 65535.0
+                            u1 = struct.unpack_from('<H', data, (i + 1) * stride)[0] / 65535.0
+                            v1 = struct.unpack_from('<H', data, (i + 1) * stride + 4)[0] / 65535.0
+                        else:
+                            u0, v0 = struct.unpack_from('<2f', data, i * stride + off)
+                            u1, v1 = struct.unpack_from('<2f', data, (i + 1) * stride + off)
+                        if 0 <= u0 <= 1 and 0 <= v0 <= 1 and 0 <= u1 <= 1 and 0 <= v1 <= 1:
+                            total_dist += abs(u0 - u1) + abs(v0 - v1)
+                            u_sum += u0; v_sum += v0
+                            u_sq += u0 * u0; v_sq += v0 * v0
+                            cnt += 1
+                    except:
+                        pass
+                if cnt > 50:
+                    # Skip constant data (metadata)
+                    u_var = u_sq / cnt - (u_sum / cnt) ** 2
+                    v_var = v_sq / cnt - (v_sum / cnt) ** 2
+                    if u_var < 1e-6 or v_var < 1e-6:
+                        continue
+                    coherence = total_dist / cnt
+                    if coherence < best_coherence:
+                        best_coherence = coherence
+                        best_fmt, best_off = fmt, off
+
+    best_score = scored[0][0]
     print(f"  [Migoto] UV: stride={stride}, format={best_fmt}, offset={best_off} ({best_score}/{min(2000, n)} valid)")
 
     out = []
@@ -149,16 +226,31 @@ def read_uvs(filepath, stride, hf_offset=None, uv_format="auto"):
         elif best_fmt == 'u16':
             u16, v16 = struct.unpack_from('<HH', data, i * stride + best_off)
             u, v = u16 / 65535.0, v16 / 65535.0
+        elif best_fmt == 'u16_split':
+            u = struct.unpack_from('<H', data, i * stride)[0] / 65535.0
+            v = struct.unpack_from('<H', data, i * stride + 4)[0] / 65535.0
         else:  # f32
             u, v = struct.unpack_from('<2f', data, i * stride + best_off)
         out.append((u, 1.0 - v))
     return out
 
 
-def read_indices(filepath):
+def read_indices(filepath, format=''):
+    """Read index buffer. Supports R16_UINT (2-byte) and R32_UINT (4-byte) indices."""
     with open(filepath, 'rb') as f:
         data = f.read()
-    return list(struct.unpack(f'<{len(data)//4}I', data))
+    fmt_lower = format.lower()
+    if 'r16' in fmt_lower:
+        return list(struct.unpack(f'<{len(data)//2}H', data))
+    elif 'r32' in fmt_lower:
+        return list(struct.unpack(f'<{len(data)//4}I', data))
+    else:
+        if len(data) % 4 != 0:
+            return list(struct.unpack(f'<{len(data)//2}H', data))
+        indices32 = list(struct.unpack(f'<{len(data)//4}I', data))
+        if len(indices32) > 0 and max(indices32) > 10000000:
+            return list(struct.unpack(f'<{len(data)//2}H', data))
+        return indices32
 
 
 # ============================================================
@@ -267,7 +359,7 @@ def build_component_texture_map(ini_path, ini_dir, resolved):
     
     # Merge: for sections with Component in name, use comp_textures
     for section in list(section_textures.keys()):
-        match = _re.search(r'Component(d+)', section)
+        match = _re.search(r'Component(\\d+)', section)
         if match:
             comp_num = int(match.group(1))
             if comp_num in comp_textures and comp_textures[comp_num]:
@@ -291,7 +383,7 @@ def parse_ini_full(ini_path):
         if s.startswith('[') and s.endswith(']'):
             current_section = s[1:-1]
             if current_section not in sections:
-                sections[current_section] = {'ib': None, 'vb0': None, 'vb1': None, 'vb2': None, 'draws': [], 'runs': [], 'textures': {}}
+                sections[current_section] = {'ib': None, 'vb0': None, 'vb1': None, 'vb2': None, 'draws': [], 'runs': [], 'textures': {}, 'hash': None, 'match_first_index': None, 'handling': None}
             continue
         if not current_section:
             continue
@@ -324,22 +416,41 @@ def parse_ini_full(ini_path):
             elif key == 'type':
                 resources[current_section]['type'] = val
 
+        # Strip 'ref ' prefix (Endfield format: ib = ref Resource_...)
+        def _strip_ref(v):
+            return v[4:].strip() if v.lower().startswith('ref ') else v
+
+        # Conditional: only take first assignment per slot (LOD0 before LOD1)
+        in_conditional = current_condition is not None
+        def _first_assign(slot):
+            return sections[current_section].get(slot) is None
+
         if key == 'ib':
-            sections[current_section]['ib'] = val if val.lower() != 'null' else None
+            if not in_conditional or _first_assign('ib'):
+                sections[current_section]['ib'] = _strip_ref(val) if val.lower() != 'null' else None
         if key == 'vb0':
-            sections[current_section]['vb0'] = val
+            if not in_conditional or _first_assign('vb0'):
+                sections[current_section]['vb0'] = _strip_ref(val)
         if key == 'vb1':
-            sections[current_section]['vb1'] = val
+            if not in_conditional or _first_assign('vb1'):
+                sections[current_section]['vb1'] = _strip_ref(val)
         if key == 'vb2':
-            sections[current_section]['vb2'] = val
+            if not in_conditional or _first_assign('vb2'):
+                sections[current_section]['vb2'] = _strip_ref(val)
         if key == 'run':
-            sections[current_section]['runs'].append(val)
+            sections[current_section]['runs'].append(_strip_ref(val))
+        if key == 'hash':
+            sections[current_section]['hash'] = val.lower()
+        if key == 'handling':
+            sections[current_section]['handling'] = val.lower()
+        if key == 'match_first_index':
+            try: sections[current_section]['match_first_index'] = int(val)
+            except: pass
 
         # Capture texture references (multiple formats)
-        if key.startswith('ps-t0') and val.lower().startswith('resource'):
-            sections[current_section]['textures']['diffuse'] = val
-        elif key.startswith('ps-t1') and val.lower().startswith('resource'):
-            sections[current_section]['textures']['lightmap'] = val
+        if key.startswith('ps-t') and val.lower().startswith('resource'):
+            slot = key.split('=')[0].strip()
+            sections[current_section]['textures'][slot] = val
         elif key == 'this' and val.lower().startswith('resource'):
             sections[current_section]['textures']['this'] = val
         elif 'diffuse' in key.lower() and val.lower().startswith('ref '):
@@ -359,9 +470,43 @@ def parse_ini_full(ini_path):
             if len(parts) == 2:
                 args = [x.strip() for x in parts[1].split(',')]
                 is_indexed = stripped.startswith('drawindexed')
-                count = int(args[0])
-                start = int(args[1]) if len(args) > 1 else 0
-                base = int(args[2]) if len(args) > 2 else 0
+                is_instanced = stripped.startswith('drawindexedinstanced')
+
+                # Handle 'drawindexed = auto' (XXMI format)
+                if is_indexed and args[0].lower() == 'auto':
+                    name = current_section
+                    for j in range(i - 1, max(i - 5, -1), -1):
+                        cl = lines[j].strip()
+                        if cl.startswith(';'):
+                            c = cl[1:].strip()
+                            if c and not c.startswith('=') and not c.startswith('draw'):
+                                name = c
+                                break
+                    variant = current_condition if current_condition and current_condition != 'else' else None
+                    sections[current_section]['draws'].append({
+                        'name': name, 'section': current_section,
+                        'type': 'drawindexed_auto',
+                        'condition': variant,
+                    })
+                    continue
+
+                # Safely parse integer args
+                def safe_int(val):
+                    try: return int(val)
+                    except (ValueError, TypeError): return None
+
+                if is_instanced:
+                    # drawindexedinstanced = count, INSTANCE_COUNT, start, base, FIRST_INSTANCE
+                    count = safe_int(args[0]) or 0
+                    start = safe_int(args[2]) if len(args) > 2 else 0
+                    base = safe_int(args[3]) if len(args) > 3 else 0
+                else:
+                    count = safe_int(args[0]) or 0
+                    start = safe_int(args[1]) if len(args) > 1 else 0
+                    base = safe_int(args[2]) if len(args) > 2 else 0
+
+                if start is None: start = 0
+                if base is None: base = 0
 
                 name = current_section
                 for j in range(i - 1, max(i - 5, -1), -1):
@@ -430,8 +575,26 @@ def parse_ini_full(ini_path):
 
     # Build final draw calls
     draw_calls = []
+
+    # Global VB collection: map hash -> {vb0, vb1, vb2}
+    hash_vb_global = {}
     for sec_name, sec_data in sections.items():
-        if not sec_data['draws']:
+        h = sec_data.get('hash')
+        if not h: continue
+        if h not in hash_vb_global:
+            hash_vb_global[h] = {'vb0': None, 'vb1': None, 'vb2': None}
+        ctx = caller_ctx.get(sec_name, {})
+        v0 = sec_data['vb0'] or ctx.get('vb0')
+        v1 = sec_data['vb1'] or ctx.get('vb1')
+        v2 = sec_data.get('vb2') or ctx.get('vb2')
+        if v0 and not hash_vb_global[h]['vb0']: hash_vb_global[h]['vb0'] = v0
+        if v1 and not hash_vb_global[h]['vb1']: hash_vb_global[h]['vb1'] = v1
+        if v2 and not hash_vb_global[h]['vb2']: hash_vb_global[h]['vb2'] = v2
+
+    # Flow 1: Sections with explicit draw calls
+    for sec_name, sec_data in sections.items():
+        explicit_draws = [d for d in sec_data['draws'] if d['type'] in ('drawindexed', 'draw')]
+        if not explicit_draws:
             continue
 
         ctx = caller_ctx.get(sec_name, {})
@@ -441,15 +604,90 @@ def parse_ini_full(ini_path):
         eff_vb2 = sec_data.get('vb2') or ctx.get('vb2')
         eff_tex = {**ctx.get('textures', {}), **sec_data['textures']}
 
-        for dc in sec_data['draws']:
+        # Try hash-based VB lookup
+        h = sec_data.get('hash')
+        if h and h in hash_vb_global:
+            if not eff_vb0 and hash_vb_global[h]['vb0']: eff_vb0 = hash_vb_global[h]['vb0']
+            if not eff_vb1 and hash_vb_global[h]['vb1']: eff_vb1 = hash_vb_global[h]['vb1']
+            if not eff_vb2 and hash_vb_global[h]['vb2']: eff_vb2 = hash_vb_global[h]['vb2']
+
+        for dc in explicit_draws:
             dc['ib_resource'] = eff_ib
             dc['vb0_resource'] = eff_vb0
             dc['vb1_resource'] = eff_vb1
             dc['vb2_resource'] = eff_vb2
             dc['textures'] = eff_tex.copy()
-            # Propagate condition if not already set
             if 'condition' not in dc:
                 dc['condition'] = None
+            draw_calls.append(dc)
+
+    # Flow 2: match_first_index sections (XXMI/ZZMI/WWMI/EFMI)
+    hash_groups = {}
+    for sec_name, sec_data in sections.items():
+        h = sec_data.get('hash')
+        if h:
+            if h not in hash_groups: hash_groups[h] = []
+            hash_groups[h].append(sec_name)
+
+    for hash_val, sec_names in hash_groups.items():
+        auto_sections = []
+        for sn in sec_names:
+            sd = sections[sn]
+            if any(d['type'] in ('drawindexed', 'draw') for d in sd['draws']):
+                continue
+            if sd.get('handling') == 'skip':
+                continue
+            if sd.get('match_first_index') is not None and sd.get('ib'):
+                auto_sections.append(sn)
+
+        if not auto_sections:
+            continue
+
+        # Get VB for this hash group
+        hb = hash_vb_global.get(hash_val, {})
+        vb0 = hb.get('vb0')
+        vb1 = hb.get('vb1')
+        vb2 = hb.get('vb2')
+        if not vb0:
+            for h2, hb2 in hash_vb_global.items():
+                if hb2.get('vb0'): vb0 = hb2['vb0']; break
+        if not vb1:
+            for h2, hb2 in hash_vb_global.items():
+                if hb2.get('vb1'): vb1 = hb2['vb1']; break
+        if not vb2:
+            for h2, hb2 in hash_vb_global.items():
+                if hb2.get('vb2'): vb2 = hb2['vb2']; break
+
+        # Collect textures
+        hash_tex = {}
+        for sn in sec_names:
+            sd = sections[sn]
+            ctx = caller_ctx.get(sn, {})
+            hash_tex.update(ctx.get('textures', {}))
+            hash_tex.update(sd['textures'])
+
+        auto_sections.sort(key=lambda sn: sections[sn]['match_first_index'])
+
+        for sn in auto_sections:
+            sd = sections[sn]
+            # Get index count from IB file size
+            index_count = 0
+            ib_res_name = sd['ib']
+            if ib_res_name in resources and 'filename' in resources[ib_res_name]:
+                ib_path = os.path.join(os.path.dirname(ini_path), resources[ib_res_name]['filename'])
+                if os.path.exists(ib_path):
+                    index_count = os.path.getsize(ib_path) // 4
+            if index_count <= 0:
+                continue
+
+            dc = {
+                'name': sn, 'section': sn, 'type': 'drawindexed',
+                'index_count': index_count, 'start_index': 0, 'base_vertex': 0,
+                'ib_resource': sd['ib'],
+                'vb0_resource': vb0, 'vb1_resource': vb1, 'vb2_resource': vb2,
+                'textures': sd['textures'].copy(),
+                'condition': None,
+            }
             draw_calls.append(dc)
 
     return draw_calls, resources
@@ -518,7 +756,7 @@ def resolve_resources(ini_dir, resources):
     return resolved
 
 
-def load_mesh_data(resolved, draw_calls, mirror_x=False, mirror_y=False, mirror_z=False, rot_x=0, rot_y=0, rot_z=0, uv_format="auto"):
+def load_mesh_data(resolved, draw_calls, mirror_x=False, mirror_y=False, mirror_z=False, rot_x=0, rot_y=0, rot_z=0, uv_format="auto", game_format="auto"):
     """Load vertex/UV/index data per IB."""
     # Find unique IBs and their associated VB resources
     ib_set = set()
@@ -540,7 +778,7 @@ def load_mesh_data(resolved, draw_calls, mirror_x=False, mirror_y=False, mirror_
         if not _resolve_lookup(resolved, ib_name):
             continue
 
-        indices = read_indices(resolved[ib_name]['path'])
+        indices = read_indices(resolved[ib_name]['path'], resolved[ib_name].get('format', ''))
 
         # Try explicit VB resources from draw calls first (WWMI format)
         vb_info = ib_vb_map.get(ib_name, {})
@@ -596,7 +834,20 @@ def load_mesh_data(resolved, draw_calls, mirror_x=False, mirror_y=False, mirror_
         uvs = []
         if uv_res and _resolve_lookup(resolved, uv_res):
             r = _resolve_lookup(resolved, uv_res)
-            uvs = read_uvs(r['path'], r['stride'], uv_format=uv_format)
+            # Game-specific UV format override
+            effective_uv_fmt = uv_format
+            if game_format == 'ef':
+                # Endfield: UV is in VB1 bytes 0-7 as float32 x2
+                vb1_r = _resolve_lookup(resolved, vb_info.get('vb1'))
+                if vb1_r and vb1_r['stride'] == 12:
+                    effective_uv_fmt = 'f32_0'
+                    uv_res = vb_info.get('vb1')
+                    r = vb1_r
+            if game_format == 'ww':
+                # Wuthering Waves: UV is in TexCoord buffer, stride 16, half-float @0
+                if r and r['stride'] == 16:
+                    effective_uv_fmt = 'hf0'
+            uvs = read_uvs(r['path'], r['stride'], uv_format=effective_uv_fmt)
 
         mesh_data[ib_name] = {
             'positions': positions,
@@ -808,10 +1059,22 @@ class IMPORT_OT_3dmigoto(bpy.types.Operator, ImportHelper):
     rot_z: bpy.props.FloatProperty(name="Z 旋转 / Rotate Z", default=0, min=-360, max=360, step=10, subtype='ANGLE', unit='ROTATION')
     split_parts: BoolProperty(name="分离部件 / Split Into Parts", default=True)
     load_textures: BoolProperty(name="加载贴图 / Load Textures", default=True)
+    game_format: bpy.props.EnumProperty(
+        name="游戏 / Game",
+        items=[
+            ('auto', '自动检测 / Auto', '根据INI自动检测'),
+            ('sr', '崩铁 / Star Rail', '崩坏：星穹铁道'),
+            ('zzz', '绝区零 / ZZZ', '绝区零'),
+            ('gi', '原神 / Genshin', '原神'),
+            ('ww', '鸣潮 / Wuthering Waves', '鸣潮'),
+            ('ef', '终末地 / Endfield', '明日方舟：终末地'),
+        ],
+        default='auto',
+    )
     uv_format: bpy.props.EnumProperty(
         name="UV 格式 / UV Format",
         items=[
-            ('auto', '自动检测 / Auto', '自动检测UV格式'),
+            ('auto', '自动检测 / Auto', '自动检测UV格式（根据游戏选择会更准确）'),
             ('hf0', 'Half-float @0', ''),
             ('hf4', 'Half-float @4', ''),
             ('u16_0', 'uint16 @0', ''),
@@ -819,6 +1082,8 @@ class IMPORT_OT_3dmigoto(bpy.types.Operator, ImportHelper):
             ('u16_4', 'uint16 @4', ''),
             ('f32_4', 'float32 @4', ''),
             ('f32_0', 'float32 @0', ''),
+            ('u16_split', '终末地 VB2 / Endfield VB2', 'U@0 V@4 非连续uint16'),
+            ('ef_vb2', '终末地 VB2 @0 / Endfield VB2', 'uint16 @0 (VB2前4字节，跳过前9顶点)'),
         ],
         default='auto',
     )
@@ -834,6 +1099,22 @@ class IMPORT_OT_3dmigoto(bpy.types.Operator, ImportHelper):
 
     def _run(self, context):
         ini_path = self.filepath
+        
+        # If a directory is selected, find .ini files inside
+        if os.path.isdir(ini_path):
+            ini_found = None
+            for root, dirs, files in os.walk(ini_path):
+                for f in files:
+                    if f.lower().endswith('.ini'):
+                        ini_found = os.path.join(root, f)
+                        break
+                if ini_found:
+                    break
+            if not ini_found:
+                self.report({'ERROR'}, f'No .ini file found in directory: {ini_path}')
+                return {'CANCELLED'}
+            ini_path = ini_found
+            print(f"  [Migoto] Found INI in directory: {ini_path}")
         
         # Handle archive files (ZIP/RAR/7z)
         if ini_path.lower().endswith(('.zip', '.rar', '.7z')):
@@ -916,8 +1197,33 @@ class IMPORT_OT_3dmigoto(bpy.types.Operator, ImportHelper):
             else:
                 print(f"    {name} -> NOT FOUND")
 
+        # Determine game format
+        game_fmt = self.game_format
+        if game_fmt == 'auto':
+            # Auto-detect from INI content
+            ini_content = ''
+            try:
+                with open(ini_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    ini_content = f.read().lower()
+            except: pass
+            if 'commandlist\\efmiv1\\' in ini_content or 'commandlist/efmiv1/' in ini_content:
+                game_fmt = 'ef'
+            elif 'commandlist\\wwmiv1\\' in ini_content or 'commandlist/wwmiv1/' in ini_content:
+                game_fmt = 'ww'
+            elif 'commandlist\\xhmiv1\\' in ini_content or 'commandlist/xhmiv1/' in ini_content:
+                game_fmt = 'sr'
+            elif 'commandlist\\zzmiv1\\' in ini_content or 'commandlist/zzmiv1/' in ini_content:
+                game_fmt = 'zzz'
+            elif 'resource\\srmi\\' in ini_content or 'resource/srmi/' in ini_content:
+                game_fmt = 'sr'
+            elif 'resourcepositionbuffer' in ini_content and 'resourcetexcoordbuffer' in ini_content:
+                game_fmt = 'ww'
+            elif 'component0_vb0' in ini_content and 'meshes/' in ini_content:
+                game_fmt = 'ef'
+            print(f"  [Migoto] Game format: {game_fmt}")
+
         # Load mesh data per IB
-        mesh_data = load_mesh_data(resolved, draw_calls, mirror_x=self.mirror_x, mirror_y=self.mirror_y, mirror_z=self.mirror_z, rot_x=self.rot_x, rot_y=self.rot_y, rot_z=self.rot_z, uv_format=self.uv_format)
+        mesh_data = load_mesh_data(resolved, draw_calls, mirror_x=self.mirror_x, mirror_y=self.mirror_y, mirror_z=self.mirror_z, rot_x=self.rot_x, rot_y=self.rot_y, rot_z=self.rot_z, uv_format=self.uv_format, game_format=game_fmt)
 
         print(f"  [Migoto] Mesh data loaded: {len(mesh_data)} IBs")
 
@@ -936,7 +1242,7 @@ class IMPORT_OT_3dmigoto(bpy.types.Operator, ImportHelper):
             if sec in section_textures:
                 continue
             # Extract component number from section name
-            match = _re.search(r'Component(d+)', sec)
+            match = _re.search(r'Component(\\d+)', sec)
             if match:
                 comp_num = int(match.group(1))
                 texs = comp_textures.get(comp_num, [])
@@ -951,7 +1257,26 @@ class IMPORT_OT_3dmigoto(bpy.types.Operator, ImportHelper):
             ib = dc.get('ib_resource')
             if not ib or ib in ib_textures:
                 continue
-            tex_ref = dc.get('textures', {}).get('diffuse') or dc.get('textures', {}).get('this')
+            # Find diffuse texture by resource name (works for all game formats)
+            texs = dc.get('textures', {})
+            tex_ref = None
+            for slot_key, res_name in texs.items():
+                if not res_name: continue
+                res_lower = res_name.lower()
+                if ('diffuse' in res_lower and 'normal' not in res_lower and
+                    'lightmap' not in res_lower and 'light' not in res_lower):
+                    tex_ref = res_name
+                    break
+            # Fallback: try slot priority
+            if not tex_ref:
+                for key in ['ps-t1', 'ps-t0', 'diffuse', 'this']:
+                    if texs.get(key):
+                        candidate = texs[key]
+                        cl = candidate.lower()
+                        if 'normal' in cl or 'lightmap' in cl or 'light' in cl:
+                            continue
+                        tex_ref = candidate
+                        break
             if tex_ref and _resolve_lookup(resolved, tex_ref):
                 ib_textures[ib] = _resolve_lookup(resolved, tex_ref)['path']
             else:
