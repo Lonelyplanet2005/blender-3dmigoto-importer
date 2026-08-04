@@ -11,7 +11,7 @@ Usage:
 bl_info = {
     "name": "3Dmigoto/XXMI Model Importer",
     "author": "OpenClaw",
-    "version": (3, 0, 0),
+    "version": (3, 7, 2),
     "blender": (3, 0, 0),
     "location": "File > Import > 3Dmigoto Model (.ini)",
     "description": "Import 3Dmigoto/XXMI game mod models",
@@ -36,34 +36,39 @@ _preview_collections = {}
 # ============================================================
 
 def read_positions(filepath, stride=40, mirror_x=False, mirror_y=False, mirror_z=False, rot_x=0, rot_y=0, rot_z=0):
-    """Read XYZ positions with optional rotation and mirror."""
+    """Read XYZ positions with optional rotation and mirror. Uses NumPy for speed."""
     import math
+    import numpy as np
     with open(filepath, 'rb') as f:
         data = f.read()
     n = len(data) // stride
+    floats_per_vert = stride // 4
 
-    # Build rotation matrix from Euler angles (XYZ order)
-    cx, sx = math.cos(rot_x), math.sin(rot_x)
-    cy, sy = math.cos(rot_y), math.sin(rot_y)
-    cz, sz = math.cos(rot_z), math.sin(rot_z)
-    m00 = cx*cy;  m01 = cx*sy*sz - sx*cz;  m02 = cx*sy*cz + sx*sz
-    m10 = sx*cy;  m11 = sx*sy*sz + cx*cz;  m12 = sx*sy*cz - cx*sz
-    m20 = -sy;    m21 = cy*sz;              m22 = cy*cz
+    # Parse all vertices at once, extract XYZ columns
+    all_data = np.frombuffer(data, dtype=np.float32).reshape(n, floats_per_vert)
+    positions = all_data[:, :3].copy()  # shape (n, 3)
 
-    # Mirror factors
-    mx = -1.0 if mirror_x else 1.0
-    my = -1.0 if mirror_y else 1.0
-    mz = -1.0 if mirror_z else 1.0
+    # Apply mirror
+    mirror = np.array([
+        -1.0 if mirror_x else 1.0,
+        -1.0 if mirror_y else 1.0,
+        -1.0 if mirror_z else 1.0
+    ], dtype=np.float32)
+    positions *= mirror
 
-    out = []
-    for i in range(n):
-        x, y, z = struct.unpack_from('<3f', data, i * stride)
-        x *= mx; y *= my; z *= mz
-        nx = m00*x + m01*y + m02*z
-        ny = m10*x + m11*y + m12*z
-        nz = m20*x + m21*y + m22*z
-        out.append((nx, ny, nz))
-    return out
+    # Apply rotation if needed
+    if rot_x != 0 or rot_y != 0 or rot_z != 0:
+        cx, sx = math.cos(rot_x), math.sin(rot_x)
+        cy, sy = math.cos(rot_y), math.sin(rot_y)
+        cz, sz = math.cos(rot_z), math.sin(rot_z)
+        rot = np.array([
+            [cx*cy, cx*sy*sz - sx*cz, cx*sy*cz + sx*sz],
+            [sx*cy, sx*sy*sz + cx*cz, sx*sy*cz - cx*sz],
+            [-sy,   cy*sz,             cy*cz]
+        ], dtype=np.float32)
+        positions = positions @ rot.T
+
+    return [tuple(v) for v in positions]
 
 
 
@@ -88,7 +93,7 @@ def read_uvs(filepath, stride, hf_offset=None, uv_format="auto"):
                     u = struct.unpack_from('<H', data, i * stride)[0] / 65535.0
                     v = struct.unpack_from('<H', data, i * stride + 4)[0] / 65535.0
                     out.append((u, 1.0 - v))
-                except:
+                except Exception:
                     out.append((0.0, 0.0))
             return out
         # Endfield VB2 UV: U@0, V@2 (uint16, skip first 9 degenerate vertices)
@@ -103,7 +108,7 @@ def read_uvs(filepath, stride, hf_offset=None, uv_format="auto"):
                         u = struct.unpack_from('<H', data, i * stride)[0] / 65535.0
                         v = struct.unpack_from('<H', data, i * stride + 2)[0] / 65535.0
                         out.append((u, 1.0 - v))
-                except:
+                except Exception:
                     out.append((0.0, 0.0))
             return out
         if uv_format in fmt_map:
@@ -123,7 +128,7 @@ def read_uvs(filepath, stride, hf_offset=None, uv_format="auto"):
                     else:
                         u, v = struct.unpack_from('<2f', data, i * stride + off)
                     out.append((u, 1.0 - v))
-                except:
+                except Exception:
                     out.append((0.0, 0.0))
             return out
 
@@ -144,10 +149,10 @@ def read_uvs(filepath, stride, hf_offset=None, uv_format="auto"):
 
     # Phase 1: score by [0,1] validity (no coverage penalty - it misleads when UV range is narrow)
     scored = []  # (score, fmt, off)
+    max_sample = min(2000, n)
     for fmt, off in candidates:
         score = 0
-        sample = min(2000, n)
-        for i in range(sample):
+        for i in range(max_sample):
             try:
                 if fmt == 'hf':
                     u, v = struct.unpack_from('<ee', data, i * stride + off)
@@ -161,13 +166,14 @@ def read_uvs(filepath, stride, hf_offset=None, uv_format="auto"):
                     u, v = struct.unpack_from('<2f', data, i * stride + off)
                 if 0.0 <= u <= 1.0 and 0.0 <= v <= 1.0:
                     score += 1
-            except:
+            except Exception:
                 pass
         scored.append((score, fmt, off))
+        # Early exit: perfect score found, no need to test more
+        if score >= max_sample:
+            break
 
     # Phase 2: for top candidates, break ties using spatial coherence
-    # Consecutive vertices should have similar UVs for the correct format
-    # Constant data (metadata) also has perfect coherence - skip it
     scored.sort(key=lambda x: -x[0])
     best_fmt, best_off = scored[0][1], scored[0][2]
     if len(scored) > 1 and n > 100:
@@ -175,7 +181,7 @@ def read_uvs(filepath, stride, hf_offset=None, uv_format="auto"):
         top = [(s, f, o) for s, f, o in scored if s >= threshold and s > 0]
         if len(top) > 1:
             best_coherence = float('inf')
-            check = min(500, n - 1)
+            check = min(200, n - 1)  # Reduced from 500 for speed
             for _, fmt, off in top:
                 total_dist = 0.0
                 cnt = 0
@@ -203,7 +209,7 @@ def read_uvs(filepath, stride, hf_offset=None, uv_format="auto"):
                             u_sum += u0; v_sum += v0
                             u_sq += u0 * u0; v_sq += v0 * v0
                             cnt += 1
-                    except:
+                    except Exception:
                         pass
                 if cnt > 50:
                     # Skip constant data (metadata)
@@ -268,6 +274,136 @@ def _resolve_lookup(resolved, name):
         if k.lower() == name_lower:
             return v
     return None
+
+
+def parse_ini_toggles(ini_path):
+    """Parse global persist variables from INI as toggle definitions.
+    Returns list of {'name': str, 'var': str, 'default': int, 'max': int}
+    """
+    toggles = []
+    seen = set()
+    with open(ini_path, 'r', encoding='utf-8', errors='ignore') as f:
+        for line in f:
+            s = line.strip()
+            if not s.startswith('global persist'):
+                continue
+            m = re.match(r'global\s+persist\s+\$(\w+)\s*=\s*(-?\d+)', s)
+            if not m:
+                continue
+            var_name = m.group(1)
+            default = int(m.group(2))
+            if var_name in seen:
+                continue
+            seen.add(var_name)
+            if var_name in ('mx', 'my', 'menu', 'page'):
+                continue
+            display = var_name.replace('_', ' ').title()
+            display_map = {
+                'Top': '上衣 / Top', 'Skirt': '裙子 / Skirt', 'Hair': '发型 / Hair',
+                'Body': '身体 / Body', 'Ears': '耳朵 / Ears', 'Tail': '尾巴 / Tail',
+                'Neck': '颈部 / Neck', 'Mask': '面罩 / Mask', 'Sleeves': '袖子 / Sleeves',
+                'Booba': '胸部 / Chest', 'Hat': '帽子 / Hat', 'Socks': '袜子 / Socks',
+                'Sandal': '凉鞋 / Sandal', 'Obi': '腰带 / Obi', 'Color': '颜色 / Color',
+                'Nails': '指甲 / Nails', 'Blush': '腮红 / Blush', 'Lips': '嘴唇 / Lips',
+                'Shibari': '束缚 / Shibari', 'Pube': '体毛 / Body Hair',
+                'Ofudatop': '御札上 / Ofuda Top', 'Ofudabottom': '御札下 / Ofuda Bottom',
+                'Obiribbon': '腰带 ribbon / Obi Ribbon',
+                'Wombtattoo': '腹部纹身 / Womb Tattoo',
+                'Legaccessories': '腿部配件 / Leg Accessories',
+                'Evachoker': '项圈 / Choker', 'Evabowtie': '领结 / Bowtie',
+                'Evajacket': '夹克 / Jacket', 'Evaboots': '靴子 / Boots',
+                'Evathighstrap': '大腿带 / Thigh Strap', 'Evaears': '兽耳 / Animal Ears',
+                'Evalabubu': '拉布布 / Labubu',
+            }
+            display = display_map.get(var_name.capitalize(), display)
+            toggles.append({
+                'name': display,
+                'var': var_name,
+                'default': default,
+                'max': 1,
+            })
+
+    # Scan draw calls to find multi-value variables
+    in_condition = None
+    var_values = {}  # var -> set of values
+    with open(ini_path, 'r', encoding='utf-8', errors='ignore') as f:
+        for line in f:
+            s = line.strip()
+            if s.startswith('if ') or s.startswith('elif '):
+                cond = s.split(' ', 1)[1]
+                for vm in re.finditer(r'\$(\w+)\s*==\s*(\d+)', cond):
+                    var_values.setdefault(vm.group(1), set()).add(int(vm.group(2)))
+                for vm in re.finditer(r'\$(\w+)\s*!=\s*(\d+)', cond):
+                    var_values.setdefault(vm.group(1), set()).add(int(vm.group(2)))
+
+    # Update max for multi-value variables
+    for t in toggles:
+        if t['var'] in var_values:
+            vals = var_values[t['var']]
+            t['max'] = max(max(vals), 1)
+
+    return toggles
+
+
+def parse_condition(cond_str):
+    """Parse a condition string like '$top == 1 && $socks != 0' into structured data.
+    Returns list of (var_name, operator, value) tuples.
+    """
+    if not cond_str:
+        return []
+    parts = []
+    for clause in re.split(r'&&|\|\|', cond_str):
+        clause = clause.strip()
+        m = re.match(r'\$(\w+)\s*(==|!=|>=|<=|>|<)\s*(-?\d+)', clause)
+        if m:
+            parts.append((m.group(1), m.group(2), int(m.group(3))))
+    return parts
+
+
+def evaluate_condition(cond_parts, toggle_values):
+    """Evaluate parsed condition parts against current toggle values.
+    Returns True if condition is met (object should be visible).
+    """
+    if not cond_parts:
+        return True  # No condition = always visible
+    for var, op, val in cond_parts:
+        current = toggle_values.get(var, 0)
+        if op == '==' and current != val:
+            return False
+        elif op == '!=' and current == val:
+            return False
+        elif op == '>' and current <= val:
+            return False
+        elif op == '<' and current >= val:
+            return False
+        elif op == '>=' and current < val:
+            return False
+        elif op == '<=' and current > val:
+            return False
+    return True
+
+
+def parse_ini_toggles_from_content(ini_content):
+    """Parse toggles from INI content string (for already-read files)."""
+    toggles = []
+    seen = set()
+    for line in ini_content.split('\n'):
+        s = line.strip()
+        if not s.startswith('global persist'):
+            continue
+        m = re.match(r'global\s+persist\s+\$(\w+)\s*=\s*(-?\d+)', s)
+        if not m:
+            continue
+        var_name = m.group(1)
+        default = int(m.group(2))
+        if var_name in seen:
+            continue
+        seen.add(var_name)
+        if var_name in ('mx', 'my', 'menu', 'page'):
+            continue
+        display = var_name.replace('_', ' ').title()
+        toggles.append({'name': display, 'var': var_name, 'default': default, 'max': 1})
+    return toggles
 
 
 def build_component_texture_map(ini_path, ini_dir, resolved):
@@ -354,7 +490,7 @@ def build_component_texture_map(ini_path, ini_dir, resolved):
                         res_data = _resolve_lookup(resolved, res_name)
                         if res_data and res_data.get('path'):
                             comp_textures[comp_num].append(res_data['path'])
-                    except:
+                    except Exception:
                         pass
     
     # Merge: for sections with Component in name, use comp_textures
@@ -410,7 +546,7 @@ def parse_ini_full(ini_path):
                 resources[current_section]['filename'] = val
             elif key == 'stride':
                 try: resources[current_section]['stride'] = int(val)
-                except: pass
+                except Exception: pass
             elif key == 'format':
                 resources[current_section]['format'] = val
             elif key == 'type':
@@ -445,7 +581,7 @@ def parse_ini_full(ini_path):
             sections[current_section]['handling'] = val.lower()
         if key == 'match_first_index':
             try: sections[current_section]['match_first_index'] = int(val)
-            except: pass
+            except Exception: pass
 
         # Capture texture references (multiple formats)
         if key.startswith('ps-t') and val.lower().startswith('resource'):
@@ -702,6 +838,11 @@ def resolve_resources(ini_dir, resources):
     all_files_rel = {}
     all_files_name = {}
     for root, dirs, files in os.walk(ini_dir):
+        # Limit scan depth to 3 levels for performance
+        depth = root.replace(ini_dir, '').count(os.sep)
+        if depth > 3:
+            dirs.clear()
+            continue
         for f in files:
             fp = os.path.join(root, f)
             rel = os.path.relpath(fp, ini_dir).replace('\\', '/')
@@ -751,7 +892,14 @@ def resolve_resources(ini_dir, resources):
             # Debug: show what we tried
             if 'Buffer' in rname or 'Index' in rname:
                 print(f"    NOT FOUND: {rname} -> {fname}")
-                print(f"      candidate={candidate} exists={os.path.exists(candidate)}")
+                print(f"      Tried: {candidate}")
+                # Suggest possible causes
+                basename = os.path.basename(fname)
+                similar = [f for f in all_files_name if basename.lower() in f.lower() or f.lower() in basename.lower()]
+                if similar:
+                    print(f"      Similar files found: {similar[:3]}")
+                elif not os.path.isdir(ini_dir):
+                    print(f"      Directory does not exist: {ini_dir}")
     
     return resolved
 
@@ -784,6 +932,32 @@ def load_mesh_data(resolved, draw_calls, mirror_x=False, mirror_y=False, mirror_
         vb_info = ib_vb_map.get(ib_name, {})
         pos_res = vb_info.get('vb0')
         uv_res = vb_info.get('vb2') or vb_info.get('vb1')  # WWMI uses vb2 for texcoord
+
+        # Verify UV resource is actually a texcoord buffer, not a blend buffer
+        # (In XXMI format, both Blend and Texcoord can be on vb1 with different hashes)
+        if uv_res and _resolve_lookup(resolved, uv_res):
+            r_check = _resolve_lookup(resolved, uv_res)
+            stride = r_check.get('stride', 0)
+            name_lower = (uv_res or '').lower()
+            is_blend = ('blend' in name_lower or 'weight' in name_lower or
+                       stride in (32, 48, 64, 96, 128))
+            if is_blend:
+                # Search for actual texcoord resource with same component prefix
+                ib_clean = ib_name.replace('Resource', '').replace('_', '').lower()
+                for rname in resolved:
+                    rl = rname.lower()
+                    if 'texcoord' in rl or 'texcoord' in rl:
+                        # Check if same component (e.g. both "Head")
+                        r_clean = rname.replace('Resource', '').replace('Texcoord', '').replace('_', '').lower()
+                        if ib_clean.startswith(r_clean) or r_clean.startswith(ib_clean.replace('ib', '').replace('aib', '')):
+                            uv_res = rname
+                            break
+                # Fallback: just find any texcoord resource
+                if is_blend:
+                    for rname in resolved:
+                        if 'texcoord' in rname.lower():
+                            uv_res = rname
+                            break
 
         # Fall back to hash/prefix matching (3Dmigoto format)
         if not pos_res or pos_res not in resolved:
@@ -860,49 +1034,240 @@ def load_mesh_data(resolved, draw_calls, mirror_x=False, mirror_y=False, mirror_
     return mesh_data
 
 
-def find_textures(ini_dir, resources, resolved):
-    """Find diffuse textures from resolved resource paths."""
-    textures = {}
-    
+# Texture type classification keywords
+TEX_TYPE_KEYWORDS = {
+    'diffuse': ['diffuse', 'basecolor', 'base_color', 'albedo', 'color'],
+    'lightmap': ['lightmap', 'light_map', 'specular', 'spec', 'roughness'],
+    'normal': ['normal', 'normalmap', 'normal_map'],
+    'shadow': ['shadow', 'ao', 'ambient_occlusion'],
+    'fx': ['fx', 'emission', 'emissive', 'glow', 'stockingmap', 'stocking', 'materialmap'],
+    'alpha': ['alpha', 'transparency', 'opacity', 'mask'],
+}
+
+
+def classify_texture(filepath_or_name):
+    """Classify texture type from filename or resource name."""
+    name_lower = os.path.basename(filepath_or_name).lower()
+    for tex_type, keywords in TEX_TYPE_KEYWORDS.items():
+        for kw in keywords:
+            if kw in name_lower:
+                return tex_type
+    return 'unknown'
+
+
+def find_all_textures(ini_dir, resources, resolved, search_dirs=None):
+    """Find ALL textures from resources, classified by type.
+    Returns dict: {resource_name: {'path': ..., 'type': ..., 'slot': ...}}
+    """
+    if search_dirs is None:
+        search_dirs = [ini_dir]
+
+    all_tex = {}
+
+    # From resolved resources
     for rname, rdata in resources.items():
-        if 'filename' not in rdata:
+        fname = rdata.get('filename', '')
+        if not fname:
             continue
-        
-        fname = rdata['filename'].replace('\\', '/')
         fl = fname.lower()
-        rl = rname.lower()
-        
-        # Skip non-texture resources
         if not any(ext in fl for ext in ['.dds', '.png', '.jpg', '.tga']):
             continue
-        
+
         # Get resolved path
         fp = None
         if rname in resolved:
             fp = resolved[rname]['path']
         elif os.path.exists(os.path.join(ini_dir, fname)):
             fp = os.path.join(ini_dir, fname)
-        
         if not fp or not os.path.exists(fp):
             continue
-        
-        # Classify texture by resource name and path
-        if 'face' in rl or 'face' in fl or 'head' in fl:
-            if 'diffuse' in rl or 'base' in fl or 'diffuse' in fl:
-                k = 'face_diffuse2' if '2' in fl else 'face_diffuse1'
-                textures[k] = fp
-        elif 'hair' in rl or 'hair' in fl:
-            if 'diffuse' in rl or 'base' in fl or 'diffuse' in fl:
-                textures['hair_diffuse'] = fp
-        elif 'body' in rl or 'body' in fl:
-            if 'diffuse' in rl or 'base' in fl or 'diffuse' in fl:
-                textures['body_diffuse'] = fp
-    
-    return textures
+
+        tex_type = classify_texture(fname)
+        all_tex[rname] = {'path': fp, 'type': tex_type, 'filename': fname}
+
+    return all_tex
+
+
+def assign_textures_to_material(mat, tex_assignments, name_prefix=''):
+    """Assign multiple texture types to a material's Principled BSDF.
+    tex_assignments: dict of {tex_type: filepath}
+    """
+    if not mat or not mat.use_nodes:
+        return
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+
+    # Find BSDF node
+    bsdf = None
+    for n in nodes:
+        if n.type == 'BSDF_PRINCIPLED':
+            bsdf = n
+            break
+    if not bsdf:
+        return
+
+    # Track node positions for layout
+    y_offset = -300
+
+    for tex_type, filepath in tex_assignments.items():
+        if not filepath or not os.path.exists(filepath):
+            continue
+
+        # Load image
+        img_name = f"{name_prefix}_{tex_type}"
+        img = load_dds(filepath, img_name)
+        if not img:
+            continue
+
+        # Set color space
+        if tex_type in ('diffuse', 'fx'):
+            img.colorspace_settings.name = 'sRGB'
+        else:
+            img.colorspace_settings.name = 'Non-Color'
+
+        # Create texture node
+        tex_node = nodes.new('ShaderNodeTexImage')
+        tex_node.location = (-600, y_offset)
+        tex_node.image = img
+        tex_node.label = f"{tex_type}: {os.path.basename(filepath)}"
+
+        # Connect to appropriate BSDF input
+        if tex_type == 'diffuse':
+            links.new(tex_node.outputs['Color'], bsdf.inputs['Base Color'])
+        elif tex_type == 'normal':
+            # Normal map needs a Normal Map node
+            nm_node = nodes.new('ShaderNodeNormalMap')
+            nm_node.location = (-300, y_offset)
+            links.new(tex_node.outputs['Color'], nm_node.inputs['Color'])
+            links.new(nm_node.outputs['Normal'], bsdf.inputs['Normal'])
+        elif tex_type == 'lightmap':
+            # LightMap often used as specular/roughness
+            # Try connecting to Specular or Roughness
+            if 'Specular IOR Level' in bsdf.inputs:
+                links.new(tex_node.outputs['Color'], bsdf.inputs['Specular IOR Level'])
+            elif 'Specular' in bsdf.inputs:
+                links.new(tex_node.outputs['Color'], bsdf.inputs['Specular'])
+        elif tex_type == 'shadow':
+            # Shadow/AO map - mix with diffuse
+            pass  # Usually baked into diffuse
+        elif tex_type == 'fx':
+            # Emission/FX
+            if 'Emission Color' in bsdf.inputs:
+                links.new(tex_node.outputs['Color'], bsdf.inputs['Emission Color'])
+            elif 'Emission' in bsdf.inputs:
+                links.new(tex_node.outputs['Color'], bsdf.inputs['Emission'])
+        elif tex_type == 'alpha':
+            links.new(tex_node.outputs['Alpha'], bsdf.inputs['Alpha'])
+            mat.blend_method = 'CLIP'
+
+        y_offset -= 250
+
+
+def find_texture_slots_from_ini(ini_path, draw_calls):
+    """Parse INI to find texture slot assignments per draw call section.
+    Returns: {section_name: {'ps-t0': resource_name, 'ps-t1': resource_name, ...}}
+    """
+    section_slots = {}
+    current_section = None
+
+    with open(ini_path, 'r', encoding='utf-8', errors='ignore') as f:
+        for line in f:
+            s = line.strip()
+            if s.startswith('[') and s.endswith(']'):
+                current_section = s[1:-1]
+                continue
+            if not current_section or '=' not in s:
+                continue
+            key, val = s.split('=', 1)
+            key, val = key.strip(), val.strip()
+
+            # Capture ps-t* and this = Resource references
+            if key.startswith('ps-t') and val.startswith('Resource'):
+                if current_section not in section_slots:
+                    section_slots[current_section] = {}
+                section_slots[current_section][key] = val
+            elif key == 'this' and val.startswith('Resource'):
+                if current_section not in section_slots:
+                    section_slots[current_section] = {}
+                section_slots[current_section]['this'] = val
+
+    return section_slots
+
+
+def build_texture_assignment_map(ini_path, ini_dir, resources, resolved, draw_calls):
+    """Build texture assignments per draw call.
+    Returns: {section_name: {'diffuse': path, 'lightmap': path, 'normal': path, ...}}
+    """
+    section_slots = find_texture_slots_from_ini(ini_path, draw_calls)
+    all_tex = find_all_textures(ini_dir, resources, resolved)
+
+    # Build resource name -> path mapping
+    res_to_path = {}
+    for rname, rdata in all_tex.items():
+        res_to_path[rname] = rdata['path']
+        # Also add without 'Resource' prefix
+        clean = rname.replace('Resource', '').lower()
+        res_to_path[clean] = rdata['path']
+
+    result = {}
+
+    for dc in draw_calls:
+        sec = dc.get('section', '')
+        if sec in result:
+            continue
+
+        tex_assign = {}
+        slots = section_slots.get(sec, {})
+
+        # Also check draw call's own textures dict
+        dc_texs = dc.get('textures', {})
+        all_slots = {**slots, **dc_texs}
+
+        for slot_key, res_name in all_slots.items():
+            if not res_name:
+                continue
+
+            # Resolve resource to file path
+            fp = None
+            if res_name in resolved:
+                fp = resolved[res_name].get('path')
+            elif res_name in res_to_path:
+                fp = res_to_path[res_name]
+
+            if not fp or not os.path.exists(fp):
+                continue
+
+            # Classify by resource name or filename
+            tex_type = classify_texture(res_name)
+            if tex_type == 'unknown':
+                tex_type = classify_texture(fp)
+
+            if tex_type != 'unknown' and tex_type not in tex_assign:
+                tex_assign[tex_type] = fp
+
+        if tex_assign:
+            result[sec] = tex_assign
+
+    return result
+
+
+def check_dds_format(filepath):
+    """Check DDS format. Returns DX10 format code or None."""
+    try:
+        with open(filepath, 'rb') as f:
+            header = f.read(132)
+        if len(header) < 132 or header[:4] != b'DDS ':
+            return None
+        fourcc = header[84:88]
+        if fourcc == b'DX10':
+            return struct.unpack_from('<I', header, 128)[0]
+        return None
+    except Exception:
+        return None
 
 
 def load_dds(filepath, name):
-    """Load texture into Blender. Let Blender handle DDS natively."""
+    """Load texture into Blender. Handles BC7 DDS conversion."""
     if not filepath:
         return None
     if not os.path.exists(filepath):
@@ -916,34 +1281,69 @@ def load_dds(filepath, name):
             img = bpy.data.images.load(filepath)
             img.name = name
             return img
-        except:
+        except Exception:
             return None
     
-    # For DDS files: try Blender's native DDS loader first
+    # Check DDS format - BC7 DDS files often have alpha=0 (mask textures)
+    # Blender reads the alpha channel and makes the mesh transparent
+    # Solution: convert BC7 DDS via PNG with alpha forced to 255
+    dds_fmt = check_dds_format(filepath)
+    is_diffuse = 'Diffuse' in name or 'diffuse' in name or 'Base' in name
+    if dds_fmt in (98, 99, 95, 83, 84):  # BC7_UNORM, BC7_SRGB, BC6H, BC5
+        # Convert via Pillow with alpha fix
+        try:
+            from PIL import Image as PILImage
+            import tempfile
+            temp_dir = os.path.join(tempfile.gettempdir(), 'migoto_tex')
+            os.makedirs(temp_dir, exist_ok=True)
+            png_name = os.path.splitext(os.path.basename(filepath))[0] + '.png'
+            png_path = os.path.join(temp_dir, png_name)
+            if not os.path.exists(png_path):
+                pil_img = PILImage.open(filepath)
+                if pil_img.mode == 'RGBA':
+                    r, g, b, a = pil_img.split()
+                    a_data = list(a.getdata())
+                    zero_ratio = sum(1 for v in a_data if v < 10) / len(a_data)
+                    if zero_ratio > 0.3:  # More than 30% alpha near zero
+                        a = PILImage.new('L', pil_img.size, 255)
+                        pil_img = PILImage.merge('RGBA', (r, g, b, a))
+                        print(f"  [Migoto] Fixed alpha ({zero_ratio:.0%} was zero): {os.path.basename(filepath)}")
+                elif pil_img.mode == 'RGB':
+                    pil_img = pil_img.convert('RGBA')
+                pil_img.save(png_path)
+            img = bpy.data.images.load(png_path)
+            img.name = name
+            img.colorspace_settings.name = 'sRGB' if is_diffuse else 'Non-Color'
+            return img
+        except Exception as e:
+            print(f"  [Migoto] BC7 conversion failed: {os.path.basename(filepath)}: {e}")
+    
+    # For other DDS formats: try Blender's native DDS loader
     try:
         img = bpy.data.images.load(filepath)
         img.name = name
-        # Set color space for diffuse textures
-        if 'Diffuse' in name or 'diffuse' in name:
-            img.colorspace_settings.name = 'sRGB'
-        else:
-            img.colorspace_settings.name = 'Non-Color'
+        img.colorspace_settings.name = 'sRGB' if is_diffuse else 'Non-Color'
+        if img.size[0] == 0 or img.size[1] == 0:
+            bpy.data.images.remove(img)
+            raise Exception('Empty image')
         return img
     except Exception as e:
         print(f"  [Migoto] Blender DDS load failed: {os.path.basename(filepath)}: {e}")
     
-    # Fallback: convert DDS to PNG via Pillow (only if Blender can't load)
+    # Fallback: convert DDS to PNG via Pillow
     try:
         from PIL import Image as PILImage
         import tempfile
-        temp_dir = tempfile.mkdtemp(prefix='migoto_tex_')
+        temp_dir = os.path.join(tempfile.gettempdir(), 'migoto_tex')
+        os.makedirs(temp_dir, exist_ok=True)
         png_name = os.path.splitext(os.path.basename(filepath))[0] + '.png'
         png_path = os.path.join(temp_dir, png_name)
-        PILImage.open(filepath).save(png_path)
+        if not os.path.exists(png_path):
+            PILImage.open(filepath).save(png_path)
         img = bpy.data.images.load(png_path)
         img.name = name
         return img
-    except:
+    except Exception:
         return None
 
 
@@ -951,7 +1351,10 @@ def load_dds(filepath, name):
 # Material & Mesh
 # ============================================================
 
-def make_material(name, diffuse=None, alpha=False):
+def make_material(name, diffuse=None, alpha=False, tex_assignments=None):
+    """Create a Principled BSDF material with texture support.
+    tex_assignments: dict of {tex_type: filepath} for multi-texture support.
+    """
     mat = bpy.data.materials.new(name=name)
     mat.use_nodes = True
     nodes = mat.node_tree.nodes
@@ -964,7 +1367,12 @@ def make_material(name, diffuse=None, alpha=False):
     bsdf.location = (200, 0)
     links.new(bsdf.outputs['BSDF'], out.inputs['Surface'])
     
-    # Always create texture node
+    # If we have full texture assignments, use them
+    if tex_assignments:
+        assign_textures_to_material(mat, tex_assignments, name_prefix=name)
+        return mat
+    
+    # Fallback: just diffuse
     t = nodes.new('ShaderNodeTexImage')
     t.location = (-300, 0)
     
@@ -1024,11 +1432,16 @@ def build_object(name, all_positions, all_uvs, triangles, material, collection):
     mesh.polygons.foreach_set('loop_total', [3] * len(faces))
 
     uv_layer = mesh.uv_layers.new(name='UVMap')
+    uv_array = [0.0] * (len(faces) * 6)
     for face_idx, (i0, i1, i2) in enumerate(faces):
-        base = face_idx * 3
-        uv_layer.data[base].uv = vert_uvs[i0]
-        uv_layer.data[base + 1].uv = vert_uvs[i1]
-        uv_layer.data[base + 2].uv = vert_uvs[i2]
+        base = face_idx * 6
+        u0, v0 = vert_uvs[i0]
+        u1, v1 = vert_uvs[i1]
+        u2, v2 = vert_uvs[i2]
+        uv_array[base] = u0; uv_array[base + 1] = v0
+        uv_array[base + 2] = u1; uv_array[base + 3] = v1
+        uv_array[base + 4] = u2; uv_array[base + 5] = v2
+    uv_layer.data.foreach_set('uv', uv_array)
 
     mesh.update()
 
@@ -1043,6 +1456,25 @@ def build_object(name, all_positions, all_uvs, triangles, material, collection):
 # ============================================================
 # Import Operator
 # ============================================================
+
+# Temporary file cleanup
+def cleanup_migoto_temp():
+    """Delete old temp PNG files from DDS conversions."""
+    import tempfile
+    temp_dir = os.path.join(tempfile.gettempdir(), 'migoto_tex')
+    if not os.path.isdir(temp_dir):
+        return
+    try:
+        for f in os.listdir(temp_dir):
+            fp = os.path.join(temp_dir, f)
+            if f.endswith('.png') and os.path.isfile(fp):
+                try:
+                    os.remove(fp)
+                except Exception:
+                    pass  # File may be in use by Blender
+    except Exception:
+        pass
+
 
 class IMPORT_OT_3dmigoto(bpy.types.Operator, ImportHelper):
     """Import 3Dmigoto/XXMI model"""
@@ -1059,6 +1491,7 @@ class IMPORT_OT_3dmigoto(bpy.types.Operator, ImportHelper):
     rot_z: bpy.props.FloatProperty(name="Z 旋转 / Rotate Z", default=0, min=-360, max=360, step=10, subtype='ANGLE', unit='ROTATION')
     split_parts: BoolProperty(name="分离部件 / Split Into Parts", default=True)
     load_textures: BoolProperty(name="加载贴图 / Load Textures", default=True)
+    load_special_textures: BoolProperty(name="启用特殊贴图 / Enable Special Textures", default=False, description="导入LightMap、Normal、FX等特殊贴图（Diffuse始终加载）")
     game_format: bpy.props.EnumProperty(
         name="游戏 / Game",
         items=[
@@ -1098,6 +1531,9 @@ class IMPORT_OT_3dmigoto(bpy.types.Operator, ImportHelper):
             return {'CANCELLED'}
 
     def _run(self, context):
+        # Clean up old temp PNG files from previous imports
+        cleanup_migoto_temp()
+
         ini_path = self.filepath
         
         # If a directory is selected, find .ini files inside
@@ -1172,9 +1608,20 @@ class IMPORT_OT_3dmigoto(bpy.types.Operator, ImportHelper):
         if grandparent and grandparent != parent:
             search_dirs.append(grandparent)
 
+        # Validate INI file
+        if not os.path.isfile(ini_path):
+            self.report({'ERROR'}, f'INI file not found: {ini_path}')
+            return {'CANCELLED'}
+        try:
+            with open(ini_path, 'r', encoding='utf-8', errors='ignore') as f:
+                f.read(1024)  # Test readability
+        except Exception as e:
+            self.report({'ERROR'}, f'Cannot read INI file: {e}')
+            return {'CANCELLED'}
+
         draw_calls, resources = parse_ini_full(ini_path)
         if not draw_calls:
-            self.report({'ERROR'}, "No draw calls found")
+            self.report({'ERROR'}, "No draw calls found in INI file")
             return {'CANCELLED'}
 
         # Resolve resources: try INI dir first, then parent dirs
@@ -1205,7 +1652,7 @@ class IMPORT_OT_3dmigoto(bpy.types.Operator, ImportHelper):
             try:
                 with open(ini_path, 'r', encoding='utf-8', errors='ignore') as f:
                     ini_content = f.read().lower()
-            except: pass
+            except Exception: pass
             if 'commandlist\\efmiv1\\' in ini_content or 'commandlist/efmiv1/' in ini_content:
                 game_fmt = 'ef'
             elif 'commandlist\\wwmiv1\\' in ini_content or 'commandlist/wwmiv1/' in ini_content:
@@ -1319,6 +1766,16 @@ class IMPORT_OT_3dmigoto(bpy.types.Operator, ImportHelper):
         coll['migoto_ini_dir'] = mod_root
         context.scene.collection.children.link(coll)
 
+        # Build texture assignment map from INI (all texture types)
+        tex_assign_map = {}
+        if self.load_special_textures:
+            tex_assign_map = build_texture_assignment_map(ini_path, ini_dir, resources, resolved, draw_calls)
+            if tex_assign_map:
+                total_types = sum(len(v) for v in tex_assign_map.values())
+                print(f"  [Migoto] Special textures enabled: {total_types} textures across {len(tex_assign_map)} sections")
+        else:
+            print(f"  [Migoto] Special textures disabled (enable in import options to load LightMap/Normal/FX)")
+
         # Create materials per draw call section
         materials = {}
         for dc in draw_calls:
@@ -1332,15 +1789,32 @@ class IMPORT_OT_3dmigoto(bpy.types.Operator, ImportHelper):
                 tex_path = ib_textures.get(ib)
             mat_name = f"{mod_name}_{safe_name(sec)}"
             is_hair = 'hair' in sec.lower()
-            materials[sec] = make_material(mat_name, diffuse=tex_path, alpha=is_hair)
-            if tex_path:
-                print(f"  [Migoto] Material {mat_name} -> {os.path.basename(tex_path)}")
+
+            # Use full texture assignments if special textures enabled
+            tex_assign = tex_assign_map.get(sec, {})
+            if tex_assign:
+                materials[sec] = make_material(mat_name, tex_assignments=tex_assign)
+                types_str = ', '.join(f"{k}:{os.path.basename(v)}" for k, v in tex_assign.items())
+                print(f"  [Migoto] Material {mat_name} -> {types_str}")
+            else:
+                materials[sec] = make_material(mat_name, diffuse=tex_path, alpha=is_hair)
+                if tex_path:
+                    print(f"  [Migoto] Material {mat_name} -> {os.path.basename(tex_path)}")
+
+        # Store texture assignments on collection for UI panel access
+        coll['migoto_tex_assign'] = str(tex_assign_map) if tex_assign_map else '{}'
 
         obj_count = 0
-        print(f"  [Migoto] Creating meshes...")
+        total_draws = len(draw_calls)
+        print(f"  [Migoto] Creating meshes ({total_draws} draw calls)...")
+
+        # Progress bar
+        wm = context.window_manager
+        wm.progress_begin(0, total_draws)
 
         if self.split_parts:
-            for dc in draw_calls:
+            for dc_idx, dc in enumerate(draw_calls):
+                wm.progress_update(dc_idx)
                 ib = dc.get('ib_resource')
                 if not ib or not _resolve_lookup(mesh_data, ib):
                     continue
@@ -1373,6 +1847,10 @@ class IMPORT_OT_3dmigoto(bpy.types.Operator, ImportHelper):
                     cond = dc.get('condition')
                     if cond:
                         obj['migoto_condition'] = cond
+                        # Store parsed condition for toggle evaluation
+                        cond_parts = parse_condition(cond)
+                        if cond_parts:
+                            obj['migoto_cond_parts'] = str(cond_parts)
         else:
             # Merge by IB
             ib_groups = {}
@@ -1404,6 +1882,26 @@ class IMPORT_OT_3dmigoto(bpy.types.Operator, ImportHelper):
                     if cnt > 0:
                         obj_count += 1
 
+        wm.progress_end()
+
+        # Auto-load game toggles from INI
+        toggles = parse_ini_toggles(ini_path)
+        if toggles:
+            if not hasattr(context.scene, 'migoto_game_toggles'):
+                context.scene.migoto_game_toggles = bpy.props.PointerProperty(type=MIGOTO_PG_game_toggles)
+            gt = context.scene.migoto_game_toggles
+            gt.toggles.clear()
+            for t_data in toggles:
+                item = gt.toggles.add()
+                item.name = t_data['name']
+                item.var = t_data['var']
+                item.value = t_data['default']
+                item.default = t_data['default']
+                item.max_val = t_data.get('max', 1)
+            # Store INI path
+            coll['migoto_ini_path'] = ini_path
+            print(f"  [Migoto] Loaded {len(toggles)} game toggles")
+
         self.report({'INFO'}, f"导入 {obj_count} 个对象 / Imported {obj_count} objects")
         return {'FINISHED'}
 
@@ -1422,6 +1920,26 @@ class MIGOTO_PG_texture_item(bpy.types.PropertyGroup):
     filepath: bpy.props.StringProperty(name="Path")
     category: bpy.props.StringProperty(name="Category")
     preview_icon: bpy.props.IntProperty(name="Preview Icon", default=0)
+
+
+class MIGOTO_PG_texture_state(bpy.types.PropertyGroup):
+    """贴图浏览器状态"""
+    active_index: bpy.props.IntProperty(name="Active Texture", default=0)
+
+
+class MIGOTO_PG_game_toggle(bpy.types.PropertyGroup):
+    """游戏 MOD 开关变量"""
+    name: bpy.props.StringProperty(name="显示名")
+    var: bpy.props.StringProperty(name="变量名")
+    value: bpy.props.IntProperty(name="值", default=0, min=0, max=10)
+    default: bpy.props.IntProperty(name="默认值", default=0)
+    max_val: bpy.props.IntProperty(name="最大值", default=1)
+
+
+class MIGOTO_PG_game_toggles(bpy.types.PropertyGroup):
+    """所有游戏开关"""
+    toggles: bpy.props.CollectionProperty(type=MIGOTO_PG_game_toggle)
+    active_index: bpy.props.IntProperty(default=0)
 
 
 class MIGOTO_OT_load_textures(bpy.types.Operator):
@@ -1484,21 +2002,21 @@ class MIGOTO_OT_load_textures(bpy.types.Operator):
                 preview = pcoll.load(fp, fp, 'IMAGE')
                 item.preview_icon = preview.icon_id
                 preview_loaded = True
-            except:
+            except Exception:
                 pass
             
             if not preview_loaded and fp.lower().endswith('.dds'):
                 try:
                     from PIL import Image as PILImage
                     import tempfile
-                    temp_dir = tempfile.mkdtemp(prefix='migoto_tex_')
+                    temp_dir = os.path.join(tempfile.gettempdir(), 'migoto_tex'); os.makedirs(temp_dir, exist_ok=True)
                     png_name = os.path.splitext(os.path.basename(fp))[0] + '.png'
                     png_path = os.path.join(temp_dir, png_name)
                     if not os.path.exists(png_path):
                         PILImage.open(fp).save(png_path)
                     preview = pcoll.load(fp, png_path, 'IMAGE')
                     item.preview_icon = preview.icon_id
-                except:
+                except Exception:
                     item.preview_icon = 0
 
         self.report({'INFO'}, f'加载 {len(scene.migoto_textures)} 张贴图')
@@ -1529,12 +2047,12 @@ class MIGOTO_OT_apply_texture(bpy.types.Operator):
             try:
                 from PIL import Image as PILImage
                 import tempfile
-                temp_dir = tempfile.mkdtemp(prefix='migoto_tex_')
+                temp_dir = os.path.join(tempfile.gettempdir(), 'migoto_tex'); os.makedirs(temp_dir, exist_ok=True)
                 png_name = os.path.splitext(os.path.basename(fp))[0] + '.png'
                 png_path = os.path.join(temp_dir, png_name)
                 PILImage.open(fp).save(png_path)
                 fp = png_path
-            except:
+            except Exception:
                 pass
 
         # Load image
@@ -1576,6 +2094,21 @@ class MIGOTO_OT_apply_texture(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class MIGOTO_OT_select_texture(bpy.types.Operator):
+    """选择贴图预览 / Select texture for preview"""
+    bl_idname = "migoto.select_texture"
+    bl_label = "Preview"
+    bl_options = {'REGISTER'}
+
+    index: bpy.props.IntProperty()
+
+    def execute(self, context):
+        scene = context.scene
+        if hasattr(scene, 'migoto_tex_state'):
+            scene.migoto_tex_state.active_index = self.index
+        return {'FINISHED'}
+
+
 class MIGOTO_OT_apply_texture_from_list(bpy.types.Operator):
     """从列表应用贴图 / Apply texture from list"""
     bl_idname = "migoto.apply_texture_from_list"
@@ -1589,6 +2122,10 @@ class MIGOTO_OT_apply_texture_from_list(bpy.types.Operator):
         if not hasattr(scene, 'migoto_textures') or self.index >= len(scene.migoto_textures):
             return {'CANCELLED'}
         item = scene.migoto_textures[self.index]
+
+        # Update preview index
+        if hasattr(scene, 'migoto_tex_state'):
+            scene.migoto_tex_state.active_index = self.index
 
         # Apply directly (load_dds handles DDS conversion to temp)
         bpy.ops.migoto.apply_texture(filepath=item.filepath)
@@ -1726,6 +2263,9 @@ class MIGOTO_OT_remove_group(bpy.types.Operator):
                     obj.hide_viewport = False
                     obj.hide_render = False
             mg.groups.remove(self.index)
+            # Adjust active_group
+            if mg.active_group >= len(mg.groups):
+                mg.active_group = max(0, len(mg.groups) - 1)
         return {'FINISHED'}
 
 
@@ -1798,6 +2338,44 @@ class MIGOTO_OT_toggle_obj_visibility(bpy.types.Operator):
         if obj:
             obj.hide_viewport = not obj.hide_viewport
             obj.hide_render = not obj.hide_render
+        return {'FINISHED'}
+
+
+class MIGOTO_OT_highlight_obj(bpy.types.Operator):
+    """高亮选中对象（3D视图描边） / Highlight object in viewport"""
+    bl_idname = "migoto.highlight_obj"
+    bl_label = "Highlight"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    obj_name: bpy.props.StringProperty()
+
+    def execute(self, context):
+        obj = bpy.data.objects.get(self.obj_name)
+        if not obj:
+            self.report({'WARNING'}, f'Object not found: {self.obj_name}')
+            return {'CANCELLED'}
+        # Deselect all
+        bpy.ops.object.select_all(action='DESELECT')
+        # Make visible if hidden
+        obj.hide_viewport = False
+        # Select and set active (Blender draws orange outline)
+        obj.select_set(True)
+        context.view_layer.objects.active = obj
+        # Focus viewport on the object
+        bpy.ops.object.select_all(action='DESELECT')
+        obj.select_set(True)
+        context.view_layer.objects.active = obj
+        for area in context.screen.areas:
+            if area.type == 'VIEW_3D':
+                override = context.copy()
+                override['area'] = area
+                override['region'] = area.regions[-1]
+                try:
+                    with context.temp_override(**override):
+                        bpy.ops.view3d.view_selected(use_all_regions=False)
+                except Exception:
+                    pass
+                break
         return {'FINISHED'}
 
 
@@ -1937,6 +2515,88 @@ class MIGOTO_OT_auto_group(bpy.types.Operator):
         return {'CANCELLED'}
 
 
+class MIGOTO_UL_mesh_group_items(bpy.types.UIList):
+    """网格变体列表项（带勾选框和高亮按钮）"""
+    bl_idname = "MIGOTO_UL_mesh_group_items"
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_property, index):
+        obj = bpy.data.objects.get(item.obj_name)
+        row = layout.row(align=True)
+
+        # Visibility toggle
+        is_visible = obj and not obj.hide_viewport
+        vis_icon = 'CHECKBOX_HLT' if is_visible else 'CHECKBOX_DEHLT'
+        op = row.operator('migoto.toggle_obj_visibility', text='', icon=vis_icon)
+        op.obj_name = item.obj_name
+
+        # Object name
+        row.label(text=item.obj_name, icon='OBJECT_DATA')
+
+        # Highlight button
+        op = row.operator('migoto.highlight_obj', text='', icon='RESTRICT_SELECT_OFF')
+        op.obj_name = item.obj_name
+
+        # Remove button - find group index by matching data (the group) in mesh_groups
+        mg = context.scene.migoto_mesh_groups
+        g_idx = -1
+        for gi, g in enumerate(mg.groups):
+            if g.name == data.name:
+                g_idx = gi
+                break
+        if g_idx >= 0:
+            op = row.operator('migoto.remove_obj_from_group', text='', icon='TRASH')
+            op.group_index = g_idx
+            op.item_index = index
+
+
+class MIGOTO_UL_mesh_groups(bpy.types.UIList):
+    """分组列表（左侧选择）"""
+    bl_idname = "MIGOTO_UL_mesh_groups"
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_property, index):
+        row = layout.row(align=True)
+        row.label(text=item.name, icon='GROUP')
+        # Show item count
+        row.label(text=f'({len(item.items)})')
+
+
+class MIGOTO_UL_texture_list(bpy.types.UIList):
+    """贴图列表（带预览和应用按钮）"""
+    bl_idname = "MIGOTO_UL_texture_list"
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_property, index):
+        row = layout.row(align=True)
+
+        # Preview icon
+        if item.preview_icon:
+            row.label(text='', icon_value=item.preview_icon)
+
+        # Category tag (short)
+        cat = item.category or ''
+        if cat and cat != 'root':
+            row.label(text=f'[{cat[:6]}]', icon='FILE_FOLDER')
+
+        # Texture name - click to preview
+        op = row.operator('migoto.select_texture', text=item.name, icon='IMAGE_DATA')
+        op.index = index
+
+        # Apply button
+        op = row.operator('migoto.apply_texture_from_list', text='', icon='IMPORT')
+        op.index = index
+
+    def filter_items(self, context, data, propname):
+        """Support filtering by search string."""
+        items = getattr(data, propname)
+        flags = [self.bitflag_filter_item] * len(items)
+        # If there's a filter name, filter by it
+        if self.filter_name:
+            flt = self.filter_name.lower()
+            for i, item in enumerate(items):
+                if flt not in item.name.lower() and flt not in (item.category or '').lower():
+                    flags[i] &= ~self.bitflag_filter_item
+        return flags, []
+
+
 class MIGOTO_PT_mesh_groups(bpy.types.Panel):
     """网格变体分组面板"""
     bl_label = "网格变体 / Mesh Variants"
@@ -1963,43 +2623,67 @@ class MIGOTO_PT_mesh_groups(bpy.types.Panel):
             layout.label(text='无分组 / No groups')
             return
 
-        for g_idx, group in enumerate(mg.groups):
-            box = layout.box()
+        # Two-column layout: left = group list, right = selected group's items
+        split = layout.split(factor=0.35)
 
-            # Group header
-            row = box.row()
-            row.label(text=group.name, icon='GROUP')
-            op = row.operator('migoto.rename_group', text='', icon='GREASEPENCIL')
-            op.group_index = g_idx
-            op = row.operator('migoto.remove_group', text='', icon='X')
-            op.index = g_idx
+        # Left column: group list with scrollbar
+        left_col = split.column(align=True)
+        left_col.template_list(
+            'MIGOTO_UL_mesh_groups',
+            '',
+            mg,
+            'groups',
+            mg,
+            'active_group',
+            rows=min(max(len(mg.groups), 2), 6),
+            maxrows=6,
+        )
+        # Group management buttons
+        row = left_col.row(align=True)
+        op = row.operator('migoto.rename_group', text='', icon='GREASEPENCIL')
+        if 0 <= mg.active_group < len(mg.groups):
+            op.group_index = mg.active_group
+        op = row.operator('migoto.remove_group', text='', icon='X')
+        if 0 <= mg.active_group < len(mg.groups):
+            op.index = mg.active_group
 
-            # Add selected button
-            op = box.operator('migoto.add_obj_to_group', text='添加选中 / Add Selected', icon='ADD')
-            op.group_index = g_idx
+        # Right column: items of selected group
+        right_col = split.column(align=True)
 
-            # List objects with independent checkboxes
-            for i_idx, item in enumerate(group.items):
-                row = box.row()
-                obj = bpy.data.objects.get(item.obj_name)
+        if mg.active_group < 0 or mg.active_group >= len(mg.groups):
+            right_col.label(text='选择一个分组 / Select a group')
+            return
 
-                # Checkbox toggle
-                is_visible = obj and not obj.hide_viewport
-                icon = 'CHECKBOX_HLT' if is_visible else 'CHECKBOX_DEHLT'
-                op = row.operator('migoto.toggle_obj_visibility', text=item.obj_name, icon=icon)
-                op.obj_name = item.obj_name
+        group = mg.groups[mg.active_group]
+        g_idx = mg.active_group
 
-                # Remove button
-                op = row.operator('migoto.remove_obj_from_group', text='', icon='TRASH')
-                op.group_index = g_idx
-                op.item_index = i_idx
+        right_col.label(text=group.name, icon='GROUP')
 
-            # Show all / Hide all
-            row = box.row(align=True)
-            op = row.operator('migoto.show_all_in_group', text='全部显示 / Show All', icon='HIDE_OFF')
-            op.group_index = g_idx
-            op = row.operator('migoto.hide_all_in_group', text='全部隐藏 / Hide All', icon='HIDE_ON')
-            op.group_index = g_idx
+        # Add selected button
+        op = right_col.operator('migoto.add_obj_to_group', text='添加选中 / Add Selected', icon='ADD')
+        op.group_index = g_idx
+
+        # Scrollable item list
+        if len(group.items) > 0:
+            right_col.template_list(
+                'MIGOTO_UL_mesh_group_items',
+                '',
+                group,
+                'items',
+                group,
+                'active_index',
+                rows=min(max(len(group.items), 2), 10),
+                maxrows=10,
+            )
+        else:
+            right_col.label(text='无部件 / No items')
+
+        # Show all / Hide all
+        row = right_col.row(align=True)
+        op = row.operator('migoto.show_all_in_group', text='全部显示 / Show All', icon='HIDE_OFF')
+        op.group_index = g_idx
+        op = row.operator('migoto.hide_all_in_group', text='全部隐藏 / Hide All', icon='HIDE_ON')
+        op.group_index = g_idx
 
 
 class MIGOTO_PT_panel(bpy.types.Panel):
@@ -2051,67 +2735,622 @@ class MIGOTO_PT_panel(bpy.types.Panel):
                         break
                 return
 
-            # Show texture list grouped by category
-            categories = {}
-            for i, item in enumerate(scene.migoto_textures):
-                cat = item.category or 'root'
-                if cat not in categories:
-                    categories[cat] = []
-                categories[cat].append((i, item))
+            # Texture state
+            if not hasattr(scene, 'migoto_tex_state'):
+                scene.migoto_tex_state = bpy.props.PointerProperty(type=MIGOTO_PG_texture_state)
+            tex_state = scene.migoto_tex_state
 
-            for cat, items in sorted(categories.items()):
-                cat_box = box.box()
-                cat_box.label(text=f'{cat} ({len(items)}张贴图)', icon='FILE_FOLDER')
+            # Large preview of selected texture
+            if 0 <= tex_state.active_index < len(scene.migoto_textures):
+                active_item = scene.migoto_textures[tex_state.active_index]
+                preview_box = box.box()
+                preview_box.label(text=f'预览: {active_item.name}', icon='IMAGE_DATA')
 
-                for idx, (i, item) in enumerate(items):
-                    row = cat_box.row(align=True)
+                # Try to load and show actual image
+                preview_img = None
+                img_key = f'migoto_preview_{active_item.name}'
+                if img_key in bpy.data.images:
+                    preview_img = bpy.data.images[img_key]
+                elif os.path.exists(active_item.filepath):
+                    try:
+                        # For DDS, convert to temp PNG with alpha fix
+                        fp = active_item.filepath
+                        if fp.lower().endswith('.dds'):
+                            from PIL import Image as PILImage
+                            import tempfile
+                            temp_dir = os.path.join(tempfile.gettempdir(), 'migoto_tex')
+                            os.makedirs(temp_dir, exist_ok=True)
+                            png_name = os.path.splitext(os.path.basename(fp))[0] + '_preview_fix.png'
+                            png_path = os.path.join(temp_dir, png_name)
+                            if not os.path.exists(png_path):
+                                pil_img = PILImage.open(fp)
+                                if pil_img.mode == 'RGBA':
+                                    r, g, b, a = pil_img.split()
+                                    a_data = list(a.getdata())
+                                    zero_ratio = sum(1 for v in a_data if v < 10) / len(a_data)
+                                    if zero_ratio > 0.3:
+                                        a = PILImage.new('L', pil_img.size, 255)
+                                        pil_img = PILImage.merge('RGBA', (r, g, b, a))
+                                elif pil_img.mode == 'RGB':
+                                    pil_img = pil_img.convert('RGBA')
+                                pil_img.save(png_path)
+                            fp = png_path
+                        preview_img = bpy.data.images.load(fp)
+                        preview_img.name = img_key
+                        preview_img.alpha_mode = 'NONE'
+                    except Exception:
+                        pass
 
-                    # Small preview icon
-                    if item.preview_icon:
-                        row.label(text='', icon_value=item.preview_icon)
+                if preview_img and preview_img.preview:
+                    preview_box.template_icon(icon_value=preview_img.preview.icon_id, scale=6.0)
+                elif active_item.preview_icon:
+                    preview_box.template_icon(icon_value=active_item.preview_icon, scale=6.0)
+                else:
+                    preview_box.label(text='无预览 / No preview')
 
-                    # Check if currently applied
-                    is_current = False
-                    if obj.active_material and obj.active_material.use_nodes:
-                        for node in obj.active_material.node_tree.nodes:
-                            if node.type == 'TEX_IMAGE' and node.image:
-                                try:
-                                    img_base = os.path.splitext(os.path.basename(bpy.path.abspath(node.image.filepath)))[0]
-                                    tex_base = os.path.splitext(os.path.basename(item.filepath))[0]
-                                    if img_base == tex_base:
-                                        is_current = True
-                                except:
-                                    pass
-                                break
-
-                    # Click to apply
-                    icon = 'RADIOBUT_ON' if is_current else 'IMAGE_DATA'
-                    op = row.operator('migoto.apply_texture_from_list', text=item.name, icon=icon)
-                    op.index = i
+            # Texture list with scrollbar
+            if len(scene.migoto_textures) > 0:
+                row = box.row()
+                row.template_list(
+                    'MIGOTO_UL_texture_list',
+                    '',
+                    scene,
+                    'migoto_textures',
+                    tex_state,
+                    'active_index',
+                    rows=min(max(len(scene.migoto_textures), 3), 12),
+                    maxrows=12,
+                )
+            else:
+                box.label(text='无贴图 / No textures')
         else:
             layout.label(text='请选中一个网格对象')
 
 
+class MIGOTO_OT_toggle_image_alpha(bpy.types.Operator):
+    """切换贴图Alpha模式 / Toggle image alpha mode"""
+    bl_idname = "migoto.toggle_image_alpha"
+    bl_label = "Toggle Alpha"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    image_name: bpy.props.StringProperty()
+
+    def execute(self, context):
+        img = bpy.data.images.get(self.image_name)
+        if not img:
+            self.report({'WARNING'}, f'Image not found: {self.image_name}')
+            return {'CANCELLED'}
+
+        # Cycle: NONE -> STRAIGHT -> PREMUL -> NONE
+        if img.alpha_mode == 'NONE':
+            img.alpha_mode = 'STRAIGHT'
+        elif img.alpha_mode == 'STRAIGHT':
+            img.alpha_mode = 'PREMUL'
+        else:
+            img.alpha_mode = 'NONE'
+
+        # Force viewport update
+        img.update()
+        for area in context.screen.areas:
+            area.tag_redraw()
+
+        return {'FINISHED'}
+
+
+class MIGOTO_OT_change_tex_slot(bpy.types.Operator):
+    """修改贴图槽位 / Change texture slot"""
+    bl_idname = "migoto.change_tex_slot"
+    bl_label = "Change Texture"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    mat_name: bpy.props.StringProperty()
+    tex_type: bpy.props.StringProperty()  # diffuse, lightmap, normal, etc.
+    filepath: bpy.props.StringProperty(subtype='FILE_PATH')
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def execute(self, context):
+        mat = bpy.data.materials.get(self.mat_name)
+        if not mat or not mat.use_nodes:
+            self.report({'ERROR'}, f'Material not found: {self.mat_name}')
+            return {'CANCELLED'}
+
+        fp = self.filepath
+        if not os.path.exists(fp):
+            self.report({'ERROR'}, f'File not found: {fp}')
+            return {'CANCELLED'}
+
+        # Find or create the texture node for this type
+        nodes = mat.node_tree.nodes
+        links = mat.node_tree.links
+
+        # Find BSDF
+        bsdf = None
+        for n in nodes:
+            if n.type == 'BSDF_PRINCIPLED':
+                bsdf = n
+                break
+        if not bsdf:
+            self.report({'ERROR'}, 'No Principled BSDF found')
+            return {'CANCELLED'}
+
+        # Find existing texture node with this label/type
+        tex_node = None
+        for n in nodes:
+            if n.type == 'TEX_IMAGE' and self.tex_type in (n.label or ''):
+                tex_node = n
+                break
+
+        if not tex_node:
+            # Create new node
+            tex_node = nodes.new('ShaderNodeTexImage')
+            tex_node.location = (-600, -300)
+
+        # Load image
+        img_name = f"{mat.name}_{self.tex_type}"
+        img = load_dds(fp, img_name)
+        if not img:
+            self.report({'ERROR'}, f'Failed to load: {fp}')
+            return {'CANCELLED'}
+
+        tex_node.image = img
+        tex_node.label = f"{self.tex_type}: {os.path.basename(fp)}"
+
+        # Set color space
+        if self.tex_type in ('diffuse', 'fx'):
+            img.colorspace_settings.name = 'sRGB'
+        else:
+            img.colorspace_settings.name = 'Non-Color'
+
+        # Connect to BSDF
+        # First disconnect existing connections of this type
+        for link in list(links):
+            if link.from_node == tex_node:
+                links.remove(link)
+
+        if self.tex_type == 'diffuse':
+            links.new(tex_node.outputs['Color'], bsdf.inputs['Base Color'])
+        elif self.tex_type == 'normal':
+            # Find or create Normal Map node
+            nm_node = None
+            for n in nodes:
+                if n.type == 'NORMAL_MAP':
+                    nm_node = n
+                    break
+            if not nm_node:
+                nm_node = nodes.new('ShaderNodeNormalMap')
+                nm_node.location = (-300, -300)
+            links.new(tex_node.outputs['Color'], nm_node.inputs['Color'])
+            links.new(nm_node.outputs['Normal'], bsdf.inputs['Normal'])
+        elif self.tex_type == 'lightmap':
+            if 'Specular IOR Level' in bsdf.inputs:
+                links.new(tex_node.outputs['Color'], bsdf.inputs['Specular IOR Level'])
+            elif 'Specular' in bsdf.inputs:
+                links.new(tex_node.outputs['Color'], bsdf.inputs['Specular'])
+        elif self.tex_type == 'fx':
+            if 'Emission Color' in bsdf.inputs:
+                links.new(tex_node.outputs['Color'], bsdf.inputs['Emission Color'])
+            elif 'Emission' in bsdf.inputs:
+                links.new(tex_node.outputs['Color'], bsdf.inputs['Emission'])
+        elif self.tex_type == 'alpha':
+            links.new(tex_node.outputs['Alpha'], bsdf.inputs['Alpha'])
+            mat.blend_method = 'CLIP'
+
+        self.report({'INFO'}, f'Applied {self.tex_type}: {os.path.basename(fp)}')
+        return {'FINISHED'}
+
+
+class MIGOTO_PT_texture_manager(bpy.types.Panel):
+    """贴图管理面板 - 查看和修改所有贴图槽位"""
+    bl_label = "贴图管理 / Texture Manager"
+    bl_idname = "MIGOTO_PT_texture_manager"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = '3Dmigoto'
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        obj = context.active_object
+
+        if not obj or obj.type != 'MESH':
+            layout.label(text='请选中一个网格对象 / Select a mesh object')
+            return
+
+        if not obj.active_material:
+            layout.label(text='对象无材质 / No material')
+            return
+
+        mat = obj.active_material
+        layout.label(text=f'材质: {mat.name}', icon='MATERIAL')
+
+        if not mat.use_nodes:
+            layout.label(text='材质未使用节点 / Material has no nodes')
+            return
+
+        # Find all texture nodes and their connections
+        bsdf = None
+        for n in mat.node_tree.nodes:
+            if n.type == 'BSDF_PRINCIPLED':
+                bsdf = n
+                break
+
+        if not bsdf:
+            layout.label(text='无 Principled BSDF')
+            return
+
+        # Show each texture node with its type and a change button
+        tex_nodes = [n for n in mat.node_tree.nodes if n.type == 'TEX_IMAGE']
+        if not tex_nodes:
+            layout.label(text='无贴图节点 / No texture nodes')
+            return
+
+        for tex_node in tex_nodes:
+            box = layout.box()
+            row = box.row()
+
+            # Texture type (from label or detect from connections)
+            tex_type = 'unknown'
+            if tex_node.label:
+                # Extract type from label like "diffuse: filename.dds"
+                label_parts = tex_node.label.split(':')
+                tex_type = label_parts[0].strip()
+
+            # Image name
+            img_name = tex_node.image.name if tex_node.image else 'None'
+            row.label(text=f'{tex_type}: {img_name}', icon='IMAGE_DATA')
+
+            # Alpha toggle button
+            if tex_node.image:
+                alpha_mode = tex_node.image.alpha_mode
+                alpha_icon = 'IMAGE_ALPHA' if alpha_mode != 'NONE' else 'CHECKBOX_DEHLT'
+                op = row.operator('migoto.toggle_image_alpha', text='', icon=alpha_icon)
+                op.image_name = tex_node.image.name
+
+            # Change button
+            op = row.operator('migoto.change_tex_slot', text='', icon='FILE_FOLDER')
+            op.mat_name = mat.name
+            op.tex_type = tex_type
+
+            # Show connected inputs
+            connected = []
+            for link in mat.node_tree.links:
+                if link.from_node == tex_node:
+                    connected.append(f'→ {link.to_socket.name}')
+            if connected:
+                box.label(text=f'连接: {", ".join(connected)}', icon='LINKED')
+
+        # Quick add texture buttons
+        layout.separator()
+        layout.label(text='快速添加 / Quick Add:', icon='ADD')
+        row = layout.row(align=True)
+        for tex_type in ['diffuse', 'normal', 'lightmap', 'fx', 'alpha']:
+            op = row.operator('migoto.change_tex_slot', text=tex_type.capitalize())
+            op.mat_name = mat.name
+            op.tex_type = tex_type
+
+
+class MIGOTO_OT_toggle_game_var(bpy.types.Operator):
+    """切换游戏变量值 / Toggle game variable value"""
+    bl_idname = "migoto.toggle_game_var"
+    bl_label = "Toggle"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    var_name: bpy.props.StringProperty()
+    value: bpy.props.IntProperty()
+
+    def execute(self, context):
+        scene = context.scene
+        if not hasattr(scene, 'migoto_game_toggles'):
+            return {'CANCELLED'}
+        toggles = scene.migoto_game_toggles
+
+        # Update the variable value
+        for t in toggles.toggles:
+            if t.var == self.var_name:
+                t.value = self.value
+                break
+
+        # Build current toggle values dict
+        toggle_values = {}
+        for t in toggles.toggles:
+            toggle_values[t.var] = t.value
+
+        # Evaluate all objects with conditions and show/hide
+        shown = 0
+        hidden = 0
+        for obj in bpy.data.objects:
+            if obj.type != 'MESH':
+                continue
+            cond_str = obj.get('migoto_condition', None)
+            if not cond_str:
+                continue
+
+            cond_parts = parse_condition(cond_str)
+            if not cond_parts:
+                continue
+
+            # Check if this condition involves our changed variable
+            involved = any(var == self.var_name for var, _, _ in cond_parts)
+            if not involved:
+                continue
+
+            # Evaluate condition
+            should_show = evaluate_condition(cond_parts, toggle_values)
+            if should_show and obj.hide_viewport:
+                obj.hide_viewport = False
+                obj.hide_render = False
+                shown += 1
+            elif not should_show and not obj.hide_viewport:
+                obj.hide_viewport = True
+                obj.hide_render = True
+                hidden += 1
+
+        if shown or hidden:
+            print(f"  [Migoto] ${self.var_name} = {self.value}: showed {shown}, hid {hidden}")
+
+        return {'FINISHED'}
+
+
+class MIGOTO_OT_reset_game_toggles(bpy.types.Operator):
+    """重置所有开关为默认值 / Reset all toggles to defaults"""
+    bl_idname = "migoto.reset_game_toggles"
+    bl_label = "Reset All"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        scene = context.scene
+        if not hasattr(scene, 'migoto_game_toggles'):
+            return {'CANCELLED'}
+        for t in scene.migoto_game_toggles.toggles:
+            t.value = t.default
+        self.report({'INFO'}, '已重置所有开关 / Reset all toggles')
+        return {'FINISHED'}
+
+
+class MIGOTO_OT_load_game_toggles(bpy.types.Operator):
+    """从INI加载游戏开关 / Load game toggles from INI"""
+    bl_idname = "migoto.load_game_toggles"
+    bl_label = "Load Toggles"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        scene = context.scene
+
+        # Find mod INI
+        mod_dir = None
+        for coll in bpy.data.collections:
+            if 'migoto_ini_dir' in coll:
+                mod_dir = coll['migoto_ini_dir']
+                break
+        if not mod_dir:
+            self.report({'ERROR'}, '未找到模型目录')
+            return {'CANCELLED'}
+
+        ini_path = None
+        for root, dirs, files in os.walk(mod_dir):
+            for f in files:
+                if f.lower().endswith('.ini'):
+                    ini_path = os.path.join(root, f)
+                    break
+            if ini_path:
+                break
+        if not ini_path:
+            self.report({'ERROR'}, '未找到INI文件')
+            return {'CANCELLED'}
+
+        toggles = parse_ini_toggles(ini_path)
+        if not toggles:
+            self.report({'INFO'}, 'INI中未找到游戏开关')
+            return {'CANCELLED'}
+
+        # Store on scene
+        if not hasattr(scene, 'migoto_game_toggles'):
+            scene.migoto_game_toggles = bpy.props.PointerProperty(type=MIGOTO_PG_game_toggles)
+        gt = scene.migoto_game_toggles
+        gt.toggles.clear()
+
+        for t_data in toggles:
+            item = gt.toggles.add()
+            item.name = t_data['name']
+            item.var = t_data['var']
+            item.value = t_data['default']
+            item.default = t_data['default']
+
+        # Also store INI path on collection for later reference
+        for coll in bpy.data.collections:
+            if 'migoto_ini_dir' in coll:
+                coll['migoto_ini_path'] = ini_path
+                break
+
+        self.report({'INFO'}, f'加载 {len(toggles)} 个开关')
+        return {'FINISHED'}
+
+
+class MIGOTO_PT_game_toggles(bpy.types.Panel):
+    """游戏 MOD 开关面板"""
+    bl_label = "游戏开关 / Game Toggles"
+    bl_idname = "MIGOTO_PT_game_toggles"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = '3Dmigoto'
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+
+        # Load toggles button
+        layout.operator('migoto.load_game_toggles', text='加载开关 / Load Toggles', icon='IMPORT')
+        layout.operator('migoto.reset_game_toggles', text='重置默认 / Reset Defaults', icon='LOOP_BACK')
+        layout.separator()
+
+        if not hasattr(scene, 'migoto_game_toggles'):
+            layout.label(text='点击上方按钮加载开关')
+            return
+
+        gt = scene.migoto_game_toggles
+        if not gt.toggles:
+            layout.label(text='未加载开关 / No toggles loaded')
+            return
+
+        # Draw toggles in a grid-like layout
+        for t in gt.toggles:
+            row = layout.row(align=True)
+            row.label(text=t.name)
+
+            # For boolean (max=1), show as checkbox
+            if t.max_val <= 1:
+                icon = 'CHECKBOX_HLT' if t.value != 0 else 'CHECKBOX_DEHLT'
+                op = row.operator('migoto.toggle_game_var', text='', icon=icon)
+                op.var_name = t.var
+                op.value = 0 if t.value != 0 else 1
+            else:
+                # Multi-value: show as cycle buttons
+                op = row.operator('migoto.toggle_game_var', text=str(t.value))
+                op.var_name = t.var
+                op.value = (t.value + 1) % (t.max_val + 1)
+
+
+class MIGOTO_OT_auto_fill_textures(bpy.types.Operator):
+    """自动填充贴图（从INI解析） / Auto-fill textures from INI"""
+    bl_idname = "migoto.auto_fill_textures"
+    bl_label = "Auto Fill Textures"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        # Find the mod's INI and texture assignments
+        mod_dir = None
+        for coll in bpy.data.collections:
+            if 'migoto_ini_dir' in coll:
+                mod_dir = coll['migoto_ini_dir']
+                break
+
+        if not mod_dir:
+            self.report({'ERROR'}, '未找到模型目录')
+            return {'CANCELLED'}
+
+        # Find INI file
+        ini_path = None
+        for root, dirs, files in os.walk(mod_dir):
+            for f in files:
+                if f.lower().endswith('.ini'):
+                    ini_path = os.path.join(root, f)
+                    break
+            if ini_path:
+                break
+
+        if not ini_path:
+            self.report({'ERROR'}, '未找到INI文件')
+            return {'CANCELLED'}
+
+        # Parse texture assignments from INI
+        from collections import defaultdict
+        tex_resources = {}  # resource_name -> filename
+        current = None
+        with open(ini_path, 'r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                s = line.strip()
+                if s.startswith('[') and s.endswith(']'):
+                    current = s[1:-1]
+                    continue
+                if not current or '=' not in s:
+                    continue
+                key, val = s.split('=', 1)
+                key, val = key.strip(), val.strip()
+                if current.startswith('Resource') and key == 'filename':
+                    tex_resources[current] = val
+
+        # Find texture files
+        applied = 0
+        for obj in context.selected_objects:
+            if obj.type != 'MESH' or not obj.active_material:
+                continue
+            mat = obj.active_material
+            if not mat.use_nodes:
+                continue
+
+            # Try to find matching textures from INI resources
+            obj_name_lower = obj.name.lower()
+            for rname, fname in tex_resources.items():
+                fl = fname.lower()
+                if not any(ext in fl for ext in ['.dds', '.png', '.jpg']):
+                    continue
+
+                # Try to match by name similarity
+                tex_type = classify_texture(fname)
+                if tex_type == 'unknown':
+                    continue
+
+                # Check if this texture already exists in material
+                already_exists = False
+                for n in mat.node_tree.nodes:
+                    if n.type == 'TEX_IMAGE' and n.label and tex_type in n.label:
+                        already_exists = True
+                        break
+                if already_exists:
+                    continue
+
+                # Try to find the file
+                fp = os.path.join(mod_dir, fname)
+                if not os.path.exists(fp):
+                    # Try subdirectories
+                    for root, dirs, files in os.walk(mod_dir):
+                        for f in files:
+                            if f == os.path.basename(fname):
+                                fp = os.path.join(root, f)
+                                break
+                        if os.path.exists(fp):
+                            break
+
+                if os.path.exists(fp):
+                    # Apply this texture
+                    tex_assign = {tex_type: fp}
+                    assign_textures_to_material(mat, tex_assign, name_prefix=mat.name)
+                    applied += 1
+
+        self.report({'INFO'}, f'已应用 {applied} 张贴图 / Applied {applied} textures')
+        return {'FINISHED'}
+
+
 classes = (
     MIGOTO_PG_texture_item,
+    MIGOTO_PG_texture_state,
+    MIGOTO_PG_game_toggle,
+    MIGOTO_PG_game_toggles,
     MIGOTO_PG_mesh_group_item,
     MIGOTO_PG_mesh_group,
     MIGOTO_PG_mesh_groups,
     MIGOTO_OT_load_textures,
     MIGOTO_OT_apply_texture,
     MIGOTO_OT_apply_texture_from_list,
+    MIGOTO_OT_select_texture,
     MIGOTO_OT_add_group,
     MIGOTO_OT_remove_group,
     MIGOTO_OT_add_obj_to_group,
     MIGOTO_OT_remove_obj_from_group,
     MIGOTO_OT_toggle_obj_visibility,
+    MIGOTO_OT_highlight_obj,
     MIGOTO_OT_show_all_in_group,
     MIGOTO_OT_hide_all_in_group,
     MIGOTO_OT_rename_group,
     MIGOTO_OT_auto_group,
     MIGOTO_OT_export_textures,
+    MIGOTO_UL_mesh_group_items,
+    MIGOTO_UL_mesh_groups,
+    MIGOTO_UL_texture_list,
     MIGOTO_PT_mesh_groups,
     MIGOTO_PT_panel,
+    MIGOTO_PT_texture_manager,
+    MIGOTO_OT_change_tex_slot,
+    MIGOTO_OT_toggle_image_alpha,
+    MIGOTO_OT_auto_fill_textures,
+    MIGOTO_OT_toggle_game_var,
+    MIGOTO_OT_reset_game_toggles,
+    MIGOTO_OT_load_game_toggles,
+    MIGOTO_PT_game_toggles,
     IMPORT_OT_3dmigoto,
 )
 
@@ -2122,6 +3361,8 @@ def register():
     bpy.types.TOPBAR_MT_file_import.append(menu_fn)
     bpy.types.Scene.migoto_mesh_groups = bpy.props.PointerProperty(type=MIGOTO_PG_mesh_groups)
     bpy.types.Scene.migoto_textures = bpy.props.CollectionProperty(type=MIGOTO_PG_texture_item)
+    bpy.types.Scene.migoto_tex_state = bpy.props.PointerProperty(type=MIGOTO_PG_texture_state)
+    bpy.types.Scene.migoto_game_toggles = bpy.props.PointerProperty(type=MIGOTO_PG_game_toggles)
 
 
 def unregister():
@@ -2130,6 +3371,8 @@ def unregister():
         bpy.utils.unregister_class(cls)
     del bpy.types.Scene.migoto_mesh_groups
     del bpy.types.Scene.migoto_textures
+    del bpy.types.Scene.migoto_tex_state
+    del bpy.types.Scene.migoto_game_toggles
     # Clean up preview collections
     for pcoll in _preview_collections.values():
         bpy.utils.previews.remove(pcoll)
