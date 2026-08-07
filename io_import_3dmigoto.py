@@ -11,7 +11,7 @@ Usage:
 bl_info = {
     "name": "3Dmigoto/XXMI Model Importer",
     "author": "Lonelyplanet_",
-    "version": (3, 10, 3),
+    "version": (3, 15, 0),
     "blender": (3, 0, 0),
     "location": "File > Import > 3Dmigoto Model (.ini)",
     "description": "Import 3Dmigoto/XXMI game mod models (Genshin/StarRail/ZZZ/WutheringWaves/Endfield)",
@@ -259,6 +259,64 @@ def read_indices(filepath, format=''):
         if len(indices32) > 0 and max(indices32) > 10000000:
             return list(struct.unpack(f'<{len(data)//2}H', data))
         return indices32
+
+
+def read_blend_weights(filepath, stride=32):
+    """Read blend weights from buffer.
+    Format: 4 x float32 weights + bone indices (offset varies by game/component).
+    Returns list of [(bone_idx, weight), ...] per vertex.
+    """
+    if not filepath or not os.path.exists(filepath):
+        return []
+    with open(filepath, 'rb') as f:
+        data = f.read()
+    n = len(data) // stride
+    if n == 0:
+        return []
+
+    # Auto-detect bone index offset
+    # Bone indices are uint32 values typically in range [1, 200]
+    # They appear after the 4 x float32 weights (offset >= 16)
+    bone_offset = 16  # default
+    best_count = 0
+    for off in range(16, min(stride - 3, 28), 4):
+        count = 0
+        for i in range(min(n, 500)):
+            if i * stride + off + 4 > len(data):
+                break
+            v = struct.unpack_from('<I', data, i * stride + off)[0]
+            if 0 < v < 200:
+                count += 1
+        if count > best_count:
+            best_count = count
+            bone_offset = off
+
+    # If no valid bone indices found at any offset, try offset 20
+    if best_count == 0:
+        bone_offset = 20
+
+    result = []
+    for i in range(n):
+        if i * stride + 16 > len(data):
+            result.append([])
+            continue
+        weights = struct.unpack_from('<4f', data, i * stride)
+        # Read up to 4 bone indices starting at detected offset
+        max_bones = min(4, (stride - bone_offset) // 4, (len(data) - i * stride - bone_offset) // 4)
+        bones = []
+        for j in range(max_bones):
+            try:
+                b = struct.unpack_from('<I', data, i * stride + bone_offset + j * 4)[0]
+                bones.append(b)
+            except Exception:
+                bones.append(0)
+
+        vert_weights = []
+        for w, b in zip(weights, bones):
+            if w > 0.001 and b > 0:
+                vert_weights.append((b, w))
+        result.append(vert_weights)
+    return result
 
 
 # ============================================================
@@ -1025,10 +1083,51 @@ def load_mesh_data(resolved, draw_calls, mirror_x=False, mirror_y=False, mirror_
                     effective_uv_fmt = 'hf0'
             uvs = read_uvs(r['path'], r['stride'], uv_format=effective_uv_fmt)
 
+        # Read blend weights
+        blend_res = vb_info.get('vb2') or vb_info.get('vb1')
+        # Verify it's actually a blend buffer
+        if blend_res and _resolve_lookup(resolved, blend_res):
+            br = _resolve_lookup(resolved, blend_res)
+            blend_name_lower = (blend_res or '').lower()
+            if 'texcoord' in blend_name_lower or 'position' in blend_name_lower:
+                blend_res = None
+        # For EFMI: blend is vb1, but vb1 might also be texcoord
+        if game_format == 'ef' and blend_res:
+            br = _resolve_lookup(resolved, blend_res)
+            if br and br.get('stride', 0) not in (8, 12, 16, 32, 48, 64):
+                blend_res = None
+
+        # Fallback: find blend buffer by name matching (XXMI/ZZZ format)
+        # IB name like 'Resource625c2692Blend' -> find matching 'Resource625c2692Blend'
+        if not blend_res or not _resolve_lookup(resolved, blend_res):
+            ib_clean = ib_name.replace('Resource', '').replace('IB', '').replace('AIB', '').replace('BIB', '').replace('_', '').lower()
+            for rname in resolved:
+                rl = rname.lower()
+                if 'blend' in rl:
+                    # Check if same component prefix
+                    r_clean = rname.replace('Resource', '').replace('Blend', '').replace('CS', '').replace('_', '').lower()
+                    if ib_clean.startswith(r_clean) or r_clean.startswith(ib_clean):
+                        blend_res = rname
+                        break
+            # Generic fallback: any blend buffer
+            if not blend_res or not _resolve_lookup(resolved, blend_res):
+                for rname in resolved:
+                    if 'blend' in rname.lower() and 'cs' not in rname.lower():
+                        blend_res = rname
+                        break
+
+        blend_weights = []
+        if blend_res and _resolve_lookup(resolved, blend_res):
+            r = _resolve_lookup(resolved, blend_res)
+            blend_weights = read_blend_weights(r['path'], r['stride'])
+            if blend_weights:
+                print(f"  [Migoto] Blend: {blend_res} ({len(blend_weights)} verts, stride={r['stride']})")
+
         mesh_data[ib_name] = {
             'positions': positions,
             'uvs': uvs,
             'indices': indices,
+            'blend_weights': blend_weights,
         }
 
         print(f"  IB: {ib_name} -> pos={pos_res} ({len(positions)} verts), uv={uv_res} ({len(uvs)} uvs), idx={len(indices)}")
@@ -1394,7 +1493,7 @@ def safe_name(name):
     return re.sub(r'[^\w\-. ]', '_', name).strip('_')
 
 
-def build_object(name, all_positions, all_uvs, triangles, material, collection):
+def build_object(name, all_positions, all_uvs, triangles, material, collection, mirror_faces=False, blend_weights=None):
     """Build Blender mesh from triangles. Only creates referenced vertices."""
     used = set()
     for i0, i1, i2 in triangles:
@@ -1409,11 +1508,16 @@ def build_object(name, all_positions, all_uvs, triangles, material, collection):
 
     verts = [all_positions[i] for i in sorted_idx]
     vert_uvs = [all_uvs[i] if i < len(all_uvs) else (0.0, 0.0) for i in sorted_idx]
+    vert_blend = [blend_weights[i] if blend_weights and i < len(blend_weights) else [] for i in sorted_idx]
 
     faces = []
     for i0, i1, i2 in triangles:
         if i0 in remap and i1 in remap and i2 in remap:
-            faces.append((remap[i0], remap[i1], remap[i2]))
+            if mirror_faces:
+                # Reverse winding to fix normals after mirror
+                faces.append((remap[i0], remap[i2], remap[i1]))
+            else:
+                faces.append((remap[i0], remap[i1], remap[i2]))
     if not faces:
         return None, 0
 
@@ -1445,6 +1549,26 @@ def build_object(name, all_positions, all_uvs, triangles, material, collection):
     uv_layer.data.foreach_set('uv', uv_array)
 
     mesh.update()
+
+    # Create vertex groups from blend weights
+    if any(vert_blend):
+        # Collect all unique bone indices
+        all_bones = set()
+        for vw in vert_blend:
+            for bone_idx, weight in vw:
+                all_bones.add(bone_idx)
+
+        # Create a vertex group for each bone
+        bone_groups = {}
+        for bone_idx in sorted(all_bones):
+            vg = obj.vertex_groups.new(name=f'Bone_{bone_idx}')
+            bone_groups[bone_idx] = vg
+
+        # Assign weights
+        for vi, vw in enumerate(vert_blend):
+            for bone_idx, weight in vw:
+                if bone_idx in bone_groups and weight > 0.001:
+                    bone_groups[bone_idx].add([vi], weight, 'REPLACE')
 
     if material:
         obj.data.materials.append(material)
@@ -1870,7 +1994,9 @@ class IMPORT_OT_3dmigoto(bpy.types.Operator, ImportHelper):
                 # Material from IB
                 mat = materials.get(dc.get('section'))
 
-                obj, cnt = build_object(dc['name'], positions, uvs, tris, mat, coll)
+                obj, cnt = build_object(dc['name'], positions, uvs, tris, mat, coll,
+                                        mirror_faces=self.mirror_x or self.mirror_y or self.mirror_z,
+                                        blend_weights=md.get('blend_weights'))
                 if cnt > 0:
                     obj_count += 1
                     # Tag with variant condition
@@ -1908,7 +2034,10 @@ class IMPORT_OT_3dmigoto(bpy.types.Operator, ImportHelper):
                                 tris.append((indices[ti*3], indices[ti*3+1], indices[ti*3+2]))
                 if tris:
                     mat = materials.get(ib)
-                    obj, cnt = build_object(f"{mod_name}_merged", positions, uvs, tris, mat, coll)
+                    md = _resolve_lookup(mesh_data, ib)
+                    obj, cnt = build_object(f"{mod_name}_merged", positions, uvs, tris, mat, coll,
+                                            mirror_faces=self.mirror_x or self.mirror_y or self.mirror_z,
+                                            blend_weights=md.get('blend_weights') if md else None)
                     if cnt > 0:
                         obj_count += 1
 
@@ -3622,6 +3751,731 @@ class MIGOTO_OT_auto_fill_textures(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class MIGOTO_OT_rename_vertex_group(bpy.types.Operator):
+    """重命名顶点组 / Rename vertex group"""
+    bl_idname = "migoto.rename_vertex_group"
+    bl_label = "Rename"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    old_name: bpy.props.StringProperty()
+    new_name: bpy.props.StringProperty(name="New Name")
+
+    def invoke(self, context, event):
+        self.new_name = self.old_name
+        return context.window_manager.invoke_props_dialog(self)
+
+    def execute(self, context):
+        obj = context.active_object
+        if not obj or obj.type != 'MESH':
+            return {'CANCELLED'}
+        vg = obj.vertex_groups.get(self.old_name)
+        if vg:
+            vg.name = self.new_name
+        return {'FINISHED'}
+
+
+class MIGOTO_OT_show_vertex_weight(bpy.types.Operator):
+    """显示顶点组权重（进入权重绘制模式） / Show vertex weights (enter weight paint)"""
+    bl_idname = "migoto.show_vertex_weight"
+    bl_label = "Show Weight"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    group_name: bpy.props.StringProperty()
+
+    def execute(self, context):
+        obj = context.active_object
+        if not obj or obj.type != 'MESH':
+            self.report({'ERROR'}, '请先选中网格对象')
+            return {'CANCELLED'}
+
+        # Set active vertex group
+        vg = obj.vertex_groups.get(self.group_name)
+        if not vg:
+            self.report({'WARNING'}, f'顶点组不存在: {self.group_name}')
+            return {'CANCELLED'}
+        obj.vertex_groups.active_index = vg.index
+
+        # Enter weight paint mode to visualize weights
+        bpy.ops.object.mode_set(mode='WEIGHT_PAINT')
+
+        self.report({'INFO'}, f'显示权重: {self.group_name}')
+        return {'FINISHED'}
+
+
+class MIGOTO_OT_exit_weight_paint(bpy.types.Operator):
+    """退出权重绘制模式 / Exit weight paint mode"""
+    bl_idname = "migoto.exit_weight_paint"
+    bl_label = "退出权重绘制 / Exit Weight Paint"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        bpy.ops.object.mode_set(mode='OBJECT')
+        return {'FINISHED'}
+
+
+class MIGOTO_OT_generate_skeleton(bpy.types.Operator):
+    """[实验性] 从顶点组权重自动生成骨骼 / [Experimental] Auto-generate skeleton"""
+    bl_idname = "migoto.generate_skeleton"
+    bl_label = "生成骨骼(实验性) / Generate Skeleton (Experimental)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        import mathutils
+
+        obj = context.active_object
+        if not obj or obj.type != 'MESH':
+            self.report({'ERROR'}, '请先选中网格对象')
+            return {'CANCELLED'}
+        if not obj.vertex_groups:
+            self.report({'ERROR'}, '对象没有顶点组权重')
+            return {'CANCELLED'}
+
+        mesh = obj.data
+
+        # Calculate bone positions from vertex weights
+        bone_positions = {}
+        bone_weights_sum = {}
+
+        for vi, vert in enumerate(mesh.vertices):
+            for g in vert.groups:
+                vg_idx = g.group
+                weight = g.weight
+                if weight > 0.01:
+                    if vg_idx not in bone_positions:
+                        bone_positions[vg_idx] = [0.0, 0.0, 0.0]
+                        bone_weights_sum[vg_idx] = 0.0
+                    co = vert.co
+                    bone_positions[vg_idx][0] += co.x * weight
+                    bone_positions[vg_idx][1] += co.y * weight
+                    bone_positions[vg_idx][2] += co.z * weight
+                    bone_weights_sum[vg_idx] += weight
+
+        bone_centers = {}
+        for vg_idx in bone_positions:
+            tw = bone_weights_sum[vg_idx]
+            if tw > 0:
+                p = bone_positions[vg_idx]
+                bone_centers[vg_idx] = mathutils.Vector((p[0]/tw, p[1]/tw, p[2]/tw))
+
+        if not bone_centers:
+            self.report({'ERROR'}, '无法计算骨骼位置')
+            return {'CANCELLED'}
+
+        armature = bpy.data.armatures.new(name=f'{obj.name}_Armature')
+        arm_obj = bpy.data.objects.new(f'{obj.name}_Armature', armature)
+        context.scene.collection.objects.link(arm_obj)
+
+        context.view_layer.objects.active = arm_obj
+        bpy.ops.object.mode_set(mode='EDIT')
+
+        sorted_bones = sorted(bone_centers.items(), key=lambda x: -x[1].z)
+        edit_bones = {}
+        for vg_idx, center in sorted_bones:
+            vg = obj.vertex_groups[vg_idx]
+            bone = armature.edit_bones.new(vg.name)
+            bone.head = center
+            bone.tail = center + mathutils.Vector((0, 0, 0.05))
+            edit_bones[vg_idx] = bone
+
+        bone_list = list(edit_bones.items())
+        for i, (vg_idx, bone) in enumerate(bone_list):
+            best_parent = None
+            best_dist = float('inf')
+            head = bone.head
+            for j, (pvg_idx, p_bone) in enumerate(bone_list):
+                if i == j: continue
+                dist = (head - p_bone.head).length
+                if dist < best_dist and dist > 0.001:
+                    if p_bone.head.z >= head.z - 0.02:
+                        best_dist = dist
+                        best_parent = p_bone
+            if best_parent and best_dist < 0.3:
+                bone.parent = best_parent
+                if (bone.head - best_parent.head).length > 0.01:
+                    best_parent.tail = bone.head
+
+        bpy.ops.object.mode_set(mode='OBJECT')
+        obj.select_set(True)
+        arm_obj.select_set(True)
+        context.view_layer.objects.active = arm_obj
+        bpy.ops.object.parent_set(type='ARMATURE_NAME')
+        context.view_layer.objects.active = obj
+        obj.select_set(True)
+        arm_obj.select_set(False)
+
+        self.report({'INFO'}, f'生成 {len(edit_bones)} 根骨骼（实验性）')
+        return {'FINISHED'}
+
+
+class MIGOTO_OT_bind_bone_to_group(bpy.types.Operator):
+    """将选中的骨骼名绑定到选中的顶点组（重命名顶点组以匹配骨骼名） / Bind selected bone name to selected vertex group"""
+    bl_idname = "migoto.bind_bone_to_group"
+    bl_label = "绑定骨骼到顶点组 / Bind Bone to Group"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    bone_name: bpy.props.StringProperty(name="骨骼名 / Bone Name")
+    group_name: bpy.props.StringProperty(name="顶点组名 / Vertex Group")
+
+    def invoke(self, context, event):
+        # Pre-fill with current active bone and vertex group
+        obj = context.active_object
+        arm = None
+
+        # Find armature
+        for o in context.selected_objects:
+            if o.type == 'ARMATURE':
+                arm = o
+                break
+
+        if arm and arm.data.bones.active:
+            self.bone_name = arm.data.bones.active.name
+        if obj and obj.type == 'MESH' and obj.vertex_groups.active:
+            self.group_name = obj.vertex_groups.active.name
+
+        return context.window_manager.invoke_props_dialog(self)
+
+    def execute(self, context):
+        obj = context.active_object
+        if not obj or obj.type != 'MESH':
+            self.report({'ERROR'}, '请先选中网格对象')
+            return {'CANCELLED'}
+
+        vg = obj.vertex_groups.get(self.group_name)
+        if not vg:
+            self.report({'ERROR'}, f'顶点组不存在: {self.group_name}')
+            return {'CANCELLED'}
+
+        old_name = vg.name
+        vg.name = self.bone_name
+        self.report({'INFO'}, f'"{old_name}" → "{self.bone_name}"')
+        return {'FINISHED'}
+
+
+class MIGOTO_OT_bind_selected_bone(bpy.types.Operator):
+    """选中骨骼和顶点组后一键绑定并自动绑定骨架 / Quick bind and auto-parent to armature"""
+    bl_idname = "migoto.bind_selected_bone"
+    bl_label = "一键绑定 / Quick Bind"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        obj = context.active_object
+        if not obj or obj.type != 'MESH':
+            self.report({'ERROR'}, '请先选中网格对象')
+            return {'CANCELLED'}
+
+        arm = None
+        for o in context.selected_objects:
+            if o.type == 'ARMATURE':
+                arm = o
+                break
+        if not arm:
+            self.report({'ERROR'}, '请同时选中一个骨架')
+            return {'CANCELLED'}
+
+        bone = arm.data.bones.active
+        vg = obj.vertex_groups.active
+        if not bone:
+            self.report({'ERROR'}, '请在骨架中选中一根骨骼')
+            return {'CANCELLED'}
+        if not vg:
+            self.report({'ERROR'}, '请在顶点组中选中一个组')
+            return {'CANCELLED'}
+
+        old_name = vg.name
+        vg.name = bone.name
+
+        # Auto-parent mesh to armature if not already parented
+        self._auto_parent(obj, arm, context)
+
+        self.report({'INFO'}, f'"{old_name}" → "{bone.name}"')
+        return {'FINISHED'}
+
+    def _auto_parent(self, obj, arm, context):
+        """Auto-parent mesh to armature with Armature modifier."""
+        # Check if already has armature modifier
+        for mod in obj.modifiers:
+            if mod.type == 'ARMATURE':
+                return
+        # Add armature modifier
+        mod = obj.modifiers.new(name='Armature', type='ARMATURE')
+        mod.object = arm
+        # Set parent
+        obj.parent = arm
+        print(f"  [Migoto] Auto-parented {obj.name} to {arm.name}")
+
+
+class MIGOTO_OT_auto_bind_by_position(bpy.types.Operator):
+    """根据位置自动匹配骨骼和顶点组 / Auto-bind bones to vertex groups by position"""
+    bl_idname = "migoto.auto_bind_by_position"
+    bl_label = "自动匹配 / Auto Match"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        import mathutils
+
+        obj = context.active_object
+        if not obj or obj.type != 'MESH':
+            self.report({'ERROR'}, '请先选中网格对象')
+            return {'CANCELLED'}
+
+        arm = None
+        for o in context.selected_objects:
+            if o.type == 'ARMATURE':
+                arm = o
+                break
+        if not arm:
+            self.report({'ERROR'}, '请同时选中一个骨架')
+            return {'CANCELLED'}
+
+        mesh = obj.data
+
+        # Calculate vertex group centers
+        vg_centers = {}
+        vg_weights = {}
+        for vi, vert in enumerate(mesh.vertices):
+            for g in vert.groups:
+                if g.weight > 0.01:
+                    vg_idx = g.group
+                    if vg_idx not in vg_centers:
+                        vg_centers[vg_idx] = [0.0, 0.0, 0.0]
+                        vg_weights[vg_idx] = 0.0
+                    co = vert.co
+                    vg_centers[vg_idx][0] += co.x * g.weight
+                    vg_centers[vg_idx][1] += co.y * g.weight
+                    vg_centers[vg_idx][2] += co.z * g.weight
+                    vg_weights[vg_idx] += g.weight
+
+        vg_vectors = {}
+        for vg_idx, pos in vg_centers.items():
+            tw = vg_weights.get(vg_idx, 0)
+            if tw > 0:
+                vg_vectors[vg_idx] = mathutils.Vector((pos[0]/tw, pos[1]/tw, pos[2]/tw))
+
+        # Get bone centers (in world space, transform to mesh local space)
+        bones = [b for b in arm.data.bones]
+        bone_vectors = {}
+        arm_mat = arm.matrix_world.inverted() @ obj.matrix_world
+        for bone in bones:
+            center = (bone.head_local + bone.tail_local) / 2
+            bone_vectors[bone.name] = center
+
+        # Match each vertex group to nearest bone
+        matched = 0
+        used_bones = set()
+        for vg_idx, vg_vec in vg_vectors.items():
+            vg = obj.vertex_groups[vg_idx]
+            best_bone = None
+            best_dist = float('inf')
+            for bone_name, bone_vec in bone_vectors.items():
+                if bone_name in used_bones:
+                    continue
+                dist = (vg_vec - bone_vec).length
+                if dist < best_dist:
+                    best_dist = dist
+                    best_bone = bone_name
+            if best_bone and best_dist < 0.5:  # Max 50cm distance
+                old_name = vg.name
+                vg.name = best_bone
+                used_bones.add(best_bone)
+                matched += 1
+                print(f"  [Migoto] {old_name} -> {best_bone} (dist={best_dist:.4f})")
+
+        # Auto-parent mesh to armature if not already parented
+        has_armature = any(mod.type == 'ARMATURE' for mod in obj.modifiers)
+        if not has_armature and matched > 0:
+            mod = obj.modifiers.new(name='Armature', type='ARMATURE')
+            mod.object = arm
+            obj.parent = arm
+            print(f"  [Migoto] Auto-parented {obj.name} to {arm.name}")
+
+        self.report({'INFO'}, f'匹配 {matched} 个顶点组到骨骼')
+        return {'FINISHED'}
+
+
+class MIGOTO_OT_import_pmx_skeleton(bpy.types.Operator):
+    """从MMD tools导入的模型中提取骨架（先用MMD tools导入PMX，再点此按钮） / Extract skeleton from MMD-imported model"""
+    bl_idname = "migoto.import_pmx_skeleton"
+    bl_label = "提取MMD骨架 / Extract MMD Skeleton"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        # Find all armatures in scene
+        armatures = [obj for obj in bpy.data.objects if obj.type == 'ARMATURE']
+        if not armatures:
+            self.report({'ERROR'}, '场景中没有骨架，请先用MMD tools导入PMX')
+            return {'CANCELLED'}
+
+        # Use active object if it's an armature, otherwise use the last one
+        arm = None
+        if context.active_object and context.active_object.type == 'ARMATURE':
+            arm = context.active_object
+        else:
+            arm = armatures[-1]
+
+        # Collect MOD mesh names (from migoto collections) - don't delete these
+        mod_mesh_names = set()
+        for coll in bpy.data.collections:
+            if 'migoto_ini_dir' in coll:
+                for obj in coll.objects:
+                    if obj.type == 'MESH':
+                        mod_mesh_names.add(obj.name)
+
+        # Delete only non-MOD meshes (MMD imported meshes)
+        deleted = 0
+        for obj in list(bpy.data.objects):
+            if obj.type == 'MESH' and obj.name not in mod_mesh_names:
+                bpy.data.objects.remove(obj, do_unlink=True)
+                deleted += 1
+
+        # Select the armature
+        bpy.ops.object.select_all(action='DESELECT')
+        arm.select_set(True)
+        context.view_layer.objects.active = arm
+
+        self.report({'INFO'}, f'提取骨架: {arm.name}，删除 {deleted} 个MMD网格')
+        return {'FINISHED'}
+
+        def read_str(off, enc):
+            l = struct.unpack_from('<I', data, off)[0]
+            return data[off+4:off+4+l].decode('utf-16-le' if enc == 0 else 'utf-8', errors='ignore'), off + 4 + l
+
+        def read_int(off, sz):
+            if sz == 1: return data[off], off + 1
+            elif sz == 2: return struct.unpack_from('<h', data, off)[0], off + 2
+            elif sz == 4: return struct.unpack_from('<i', data, off)[0], off + 4
+            return 0, off
+
+        off = 9
+        gcount = data[8]
+        g = [data[off + i] for i in range(min(gcount, 8))]
+        off += gcount
+
+        enc = g[0]
+        extra_uv = g[1] if len(g) > 1 else 0
+        vidx = g[2] if len(g) > 2 else 2
+        tidx = g[3] if len(g) > 3 else 2
+        midx = g[4] if len(g) > 4 else 2
+        bidx = g[5] if len(g) > 5 else 2
+        vbase = 32 + extra_uv * 16
+
+        # Skip header text
+        for _ in range(4): _, off = read_str(off, enc)
+
+        # Skip vertices
+        vc = struct.unpack_from('<I', data, off)[0]; off += 4
+        for _ in range(vc):
+            off += vbase
+            wt = data[off]; off += 1
+            if wt == 0: off += bidx
+            elif wt == 1: off += bidx*2 + 4
+            elif wt == 2: off += bidx*4 + 4
+            elif wt == 3: off += bidx*2 + 40
+            elif wt == 4: off += bidx*4 + 4
+
+        # Skip faces
+        fc = struct.unpack_from('<I', data, off)[0]; off += 4
+        off += fc * vidx
+
+        # Skip textures
+        tc = struct.unpack_from('<I', data, off)[0]; off += 4
+        for _ in range(tc):
+            l = struct.unpack_from('<I', data, off)[0]; off += 4 + l
+
+        # Skip materials
+        mc = struct.unpack_from('<I', data, off)[0]; off += 4
+        for _ in range(mc):
+            for _ in range(2): _, off = read_str(off, enc)
+            off += 16 + 12 + 4 + 1 + 16 + 4  # diffuse+specular+ambient+flag+edge+edgesize
+            off += tidx + tidx + midx  # tex + sphtex + toon
+            _, off = read_str(off, enc)  # comment
+            off += 4  # index count
+
+        # Parse bones
+        bc = struct.unpack_from('<I', data, off)[0]; off += 4
+        bones = []
+        for _ in range(bc):
+            name_jp, off = read_str(off, enc)
+            name_en, off = read_str(off, enc)
+            x, y, z = struct.unpack_from('<3f', data, off); off += 12
+            parent, off = read_int(off, 2)
+            off += 4  # layer
+            flags = struct.unpack_from('<H', data, off)[0]; off += 2
+            off += bidx if (flags & 1) else 12
+            if flags & 8: off += bidx + 4
+            if flags & 16: off += 12
+            if flags & 32: off += 24
+            if flags & 64: off += vidx
+            if flags & 512:
+                off += bidx + 6
+                ikc = struct.unpack_from('<I', data, off)[0]; off += 4
+                for _ in range(ikc):
+                    off += bidx
+                    if data[offset] if False else data[off]: off += 25
+                    else: off += 1
+            bones.append({'name': name_jp or name_en, 'position': (x, y, z), 'parent': parent})
+        return bones
+
+
+class MIGOTO_OT_select_bone(bpy.types.Operator):
+    """选中骨骼并聚焦 / Select bone and focus"""
+    bl_idname = "migoto.select_bone"
+    bl_label = "Select Bone"
+    bl_options = {'REGISTER'}
+
+    bone_name: bpy.props.StringProperty()
+    armature_name: bpy.props.StringProperty()
+
+    def execute(self, context):
+        arm = bpy.data.objects.get(self.armature_name)
+        if not arm or arm.type != 'ARMATURE':
+            return {'CANCELLED'}
+        context.view_layer.objects.active = arm
+        arm.select_set(True)
+        bpy.ops.object.mode_set(mode='POSE')
+        bpy.ops.pose.select_all(action='DESELECT')
+        if self.bone_name in arm.pose.bones:
+            arm.pose.bones[self.bone_name].bone.select = True
+            for area in context.screen.areas:
+                if area.type == 'VIEW_3D':
+                    override = context.copy()
+                    override['area'] = area
+                    override['region'] = area.regions[-1]
+                    try:
+                        with context.temp_override(**override):
+                            bpy.ops.view3d.view_selected(use_all_regions=False)
+                    except Exception:
+                        pass
+                    break
+        return {'FINISHED'}
+
+
+class MIGOTO_OT_delete_bone(bpy.types.Operator):
+    """删除骨骼 / Delete bone"""
+    bl_idname = "migoto.delete_bone"
+    bl_label = "Delete Bone"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    bone_name: bpy.props.StringProperty()
+    armature_name: bpy.props.StringProperty()
+
+    def execute(self, context):
+        arm = bpy.data.objects.get(self.armature_name)
+        if not arm or arm.type != 'ARMATURE':
+            return {'CANCELLED'}
+        context.view_layer.objects.active = arm
+        bpy.ops.object.mode_set(mode='EDIT')
+        if self.bone_name in arm.data.edit_bones:
+            arm.data.edit_bones.remove(arm.data.edit_bones[self.bone_name])
+        bpy.ops.object.mode_set(mode='OBJECT')
+        self.report({'INFO'}, f'已删除: {self.bone_name}')
+        return {'FINISHED'}
+
+
+class MIGOTO_OT_delete_all_non_mmd(bpy.types.Operator):
+    """删除所有非MMD骨骼 / Delete all non-MMD bones"""
+    bl_idname = "migoto.delete_all_non_mmd"
+    bl_label = "删除非MMD骨骼 / Delete Non-MMD Bones"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        arm = context.active_object
+        if not arm or arm.type != 'ARMATURE':
+            for o in context.selected_objects:
+                if o.type == 'ARMATURE':
+                    arm = o
+                    break
+        if not arm:
+            self.report({'ERROR'}, '请选中一个骨架')
+            return {'CANCELLED'}
+
+        mmd_names = {
+            'センター', 'Center', '下半身', 'LowerBody', '上半身', 'UpperBody',
+            '上半身2', 'UpperBody2', '首', 'Neck', '頭', 'Head',
+            '左腕', 'LeftArm', '左ひじ', 'LeftElbow', '左手首', 'LeftWrist',
+            '右腕', 'RightArm', '右ひじ', 'RightElbow', '右手首', 'RightWrist',
+            '左足', 'LeftLeg', '左ひざ', 'LeftKnee', '左足首', 'LeftAnkle',
+            '左つま先', 'LeftToe', '右足', 'RightLeg', '右ひざ', 'RightKnee',
+            '右足首', 'RightAnkle', '右つま先', 'RightToe',
+            '左親指', 'LeftThumb', '左人指', 'LeftIndex', '左中指', 'LeftMiddle',
+            '左薬指', 'LeftRing', '左小指', 'LeftPinky',
+            '右親指', 'RightThumb', '右人指', 'RightIndex', '右中指', 'RightMiddle',
+            '右薬指', 'RightRing', '右小指', 'RightPinky',
+            '左足ＩＫ', 'LeftFootIK', '右足ＩＫ', 'RightFootIK',
+            '左肩', 'LeftShoulder', '右肩', 'RightShoulder',
+            '左目', 'LeftEye', '右目', 'RightEye', '両目', 'BothEyes',
+            '腰', 'Waist', '胸', 'Chest',
+        }
+
+        context.view_layer.objects.active = arm
+        bpy.ops.object.mode_set(mode='EDIT')
+        to_delete = []
+        for bone in arm.data.edit_bones:
+            is_mmd = bone.name in mmd_names
+            if not is_mmd:
+                for mmd in mmd_names:
+                    if mmd in bone.name and len(mmd) > 2:
+                        is_mmd = True
+                        break
+            if not is_mmd:
+                to_delete.append(bone)
+        for bone in to_delete:
+            arm.data.edit_bones.remove(bone)
+        bpy.ops.object.mode_set(mode='OBJECT')
+        self.report({'INFO'}, f'删除 {len(to_delete)} 个非MMD骨骼')
+        return {'FINISHED'}
+
+
+MMD_BONE_NAMES = {
+    'センター', 'Center', '下半身', 'LowerBody', '上半身', 'UpperBody',
+    '上半身2', 'UpperBody2', '首', 'Neck', '頭', 'Head',
+    '左腕', 'LeftArm', '左ひじ', 'LeftElbow', '左手首', 'LeftWrist',
+    '右腕', 'RightArm', '右ひじ', 'RightElbow', '右手首', 'RightWrist',
+    '左足', 'LeftLeg', '左ひざ', 'LeftKnee', '左足首', 'LeftAnkle',
+    '左つま先', 'LeftToe', '右足', 'RightLeg', '右ひざ', 'RightKnee',
+    '右足首', 'RightAnkle', '右つま先', 'RightToe',
+    '左親指', 'LeftThumb', '左人指', 'LeftIndex', '左中指', 'LeftMiddle',
+    '左薬指', 'LeftRing', '左小指', 'LeftPinky',
+    '右親指', 'RightThumb', '右人指', 'RightIndex', '右中指', 'RightMiddle',
+    '右薬指', 'RightRing', '右小指', 'RightPinky',
+    '左足ＩＫ', 'LeftFootIK', '右足ＩＫ', 'RightFootIK',
+    '左肩', 'LeftShoulder', '右肩', 'RightShoulder',
+    '左目', 'LeftEye', '右目', 'RightEye', '両目', 'BothEyes',
+    '腰', 'Waist', '胸', 'Chest',
+}
+
+
+def is_mmd_bone(name):
+    """Check if a bone name is MMD standard."""
+    if name in MMD_BONE_NAMES:
+        return True
+    for mmd in MMD_BONE_NAMES:
+        if mmd in name and len(mmd) > 2:
+            return True
+    return False
+
+
+class MIGOTO_PT_bone_manager(bpy.types.Panel):
+    """骨骼管理面板"""
+    bl_label = "骨骼管理 / Bone Manager"
+    bl_idname = "MIGOTO_PT_bone_manager"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = '3Dmigoto'
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        arm = None
+        if context.active_object and context.active_object.type == 'ARMATURE':
+            arm = context.active_object
+        else:
+            for o in context.selected_objects:
+                if o.type == 'ARMATURE':
+                    arm = o
+                    break
+
+        if not arm:
+            layout.label(text='请选中一个骨架 / Select an armature')
+            return
+
+        layout.label(text=f'骨架: {arm.name} ({len(arm.data.bones)} 根骨骼)', icon='ARMATURE_DATA')
+        row = layout.row(align=True)
+        row.scale_y = 1.3
+        row.operator('migoto.delete_all_non_mmd', text='🗑️ 删除非MMD骨骼', icon='TRASH')
+        layout.separator()
+
+        mmd_bones = [b for b in arm.data.bones if is_mmd_bone(b.name)]
+        other_bones = [b for b in arm.data.bones if not is_mmd_bone(b.name)]
+
+        box = layout.box()
+        box.label(text=f'MMD 标准骨骼 ({len(mmd_bones)})', icon='CHECKBOX_HLT')
+        for bone in mmd_bones[:30]:
+            row = box.row(align=True)
+            op = row.operator('migoto.select_bone', text=bone.name, icon='BONE_DATA')
+            op.bone_name = bone.name
+            op.armature_name = arm.name
+        if len(mmd_bones) > 30:
+            box.label(text=f'... 还有 {len(mmd_bones) - 30} 根', icon='INFO')
+
+        box = layout.box()
+        box.label(text=f'其他骨骼 ({len(other_bones)}) — 可删除', icon='ERROR')
+        for bone in other_bones[:30]:
+            row = box.row(align=True)
+            op = row.operator('migoto.select_bone', text=bone.name, icon='BONE_DATA')
+            op.bone_name = bone.name
+            op.armature_name = arm.name
+            op = row.operator('migoto.delete_bone', text='', icon='TRASH')
+            op.bone_name = bone.name
+            op.armature_name = arm.name
+        if len(other_bones) > 30:
+            box.label(text=f'... 还有 {len(other_bones) - 30} 根', icon='INFO')
+
+
+class MIGOTO_PT_vertex_groups(bpy.types.Panel):
+    """顶点组权重面板"""
+    bl_label = "顶点组 / Vertex Groups"
+    bl_idname = "MIGOTO_PT_vertex_groups"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = '3Dmigoto'
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        obj = context.active_object
+
+        # Bone binding tools - always visible
+        row = layout.row(align=True)
+        row.scale_y = 1.3
+        row.operator('migoto.bind_selected_bone', text='🦴 一键绑定 / Quick Bind', icon='LINKED')
+        row.operator('migoto.bind_bone_to_group', text='✏️ 手动绑定 / Manual Bind', icon='GREASEPENCIL')
+        row = layout.row(align=True)
+        row.scale_y = 1.2
+        row.operator('migoto.auto_bind_by_position', text='🤖 自动匹配 / Auto Match', icon='MOD_VERTEX_WEIGHT')
+        row.operator('migoto.generate_skeleton', text='⚡ 生成骨骼(实验性)', icon='ARMATURE_DATA')
+        row.operator('migoto.import_pmx_skeleton', text='📥 提取MMD骨架', icon='ARMATURE_DATA')
+        layout.separator()
+
+        # Show exit button if in weight paint mode
+        if context.mode == 'PAINT_WEIGHT':
+            row = layout.row()
+            row.scale_y = 1.5
+            row.operator('migoto.exit_weight_paint', text='退出权重绘制 / Exit Weight Paint', icon='X')
+            layout.separator()
+
+        # Show vertex group list only for mesh objects
+        if not obj or obj.type != 'MESH':
+            if obj and obj.type == 'ARMATURE':
+                layout.label(text='骨架已选中，可用上方按钮操作', icon='ARMATURE_DATA')
+            else:
+                layout.label(text='请选中网格对象或骨架', icon='QUESTION')
+            return
+
+        if not obj.vertex_groups:
+            layout.label(text='无顶点组 / No vertex groups')
+            return
+
+        # List vertex groups
+        for vg in obj.vertex_groups:
+            row = layout.row(align=True)
+            # Highlight active group
+            is_active = (obj.vertex_groups.active_index == vg.index)
+            icon = 'RADIOBUT_ON' if is_active else 'GROUP_VERTEX'
+            # Click to show weight
+            op = row.operator('migoto.show_vertex_weight', text=vg.name, icon=icon)
+            op.group_name = vg.name
+            # Rename button
+            op = row.operator('migoto.rename_vertex_group', text='', icon='GREASEPENCIL')
+            op.old_name = vg.name
+            # Delete button
+            op = row.operator('object.vertex_group_remove', text='', icon='X')
+
+        # Bulk operations
+        layout.separator()
+        row = layout.row(align=True)
+        row.operator('object.vertex_group_remove_all', text='删除全部 / Remove All', icon='TRASH')
+
+
 classes = (
     MIGOTO_PG_texture_item,
     MIGOTO_PG_texture_state,
@@ -3662,7 +4516,20 @@ classes = (
     MIGOTO_OT_toggle_game_var,
     MIGOTO_OT_reset_game_toggles,
     MIGOTO_OT_load_game_toggles,
+    MIGOTO_OT_rename_vertex_group,
+    MIGOTO_OT_show_vertex_weight,
+    MIGOTO_OT_exit_weight_paint,
+    MIGOTO_OT_generate_skeleton,
+    MIGOTO_OT_bind_bone_to_group,
+    MIGOTO_OT_bind_selected_bone,
+    MIGOTO_OT_auto_bind_by_position,
+    MIGOTO_OT_import_pmx_skeleton,
+    MIGOTO_OT_select_bone,
+    MIGOTO_OT_delete_bone,
+    MIGOTO_OT_delete_all_non_mmd,
+    MIGOTO_PT_bone_manager,
     MIGOTO_PT_game_toggles,
+    MIGOTO_PT_vertex_groups,
     IMPORT_OT_3dmigoto,
 )
 
