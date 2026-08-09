@@ -11,7 +11,7 @@ Usage:
 bl_info = {
     "name": "3Dmigoto/XXMI Model Importer",
     "author": "Lonelyplanet_",
-    "version": (3, 15, 0),
+    "version": (3, 16, 0),
     "blender": (3, 0, 0),
     "location": "File > Import > 3Dmigoto Model (.ini)",
     "description": "Import 3Dmigoto/XXMI game mod models (Genshin/StarRail/ZZZ/WutheringWaves/Endfield)",
@@ -37,7 +37,7 @@ _preview_collections = {}
 # Binary Readers
 # ============================================================
 
-def read_positions(filepath, stride=40, mirror_x=False, mirror_y=False, mirror_z=False, rot_x=0, rot_y=0, rot_z=0):
+def read_positions(filepath, stride=40, mirror_x=False, mirror_y=False, mirror_z=False, rot_x=0, rot_y=0, rot_z=0, scale=1.0):
     """Read XYZ positions with optional rotation and mirror. Uses NumPy for speed."""
     import math
     import numpy as np
@@ -57,6 +57,10 @@ def read_positions(filepath, stride=40, mirror_x=False, mirror_y=False, mirror_z
         -1.0 if mirror_z else 1.0
     ], dtype=np.float32)
     positions *= mirror
+
+    # Apply scale
+    if scale != 1.0:
+        positions *= np.float32(scale)
 
     # Apply rotation if needed
     if rot_x != 0 or rot_y != 0 or rot_z != 0:
@@ -964,7 +968,7 @@ def resolve_resources(ini_dir, resources):
     return resolved
 
 
-def load_mesh_data(resolved, draw_calls, mirror_x=False, mirror_y=False, mirror_z=False, rot_x=0, rot_y=0, rot_z=0, uv_format="auto", game_format="auto"):
+def load_mesh_data(resolved, draw_calls, mirror_x=False, mirror_y=False, mirror_z=False, rot_x=0, rot_y=0, rot_z=0, uv_format="auto", game_format="auto", scale=1.0):
     """Load vertex/UV/index data per IB."""
     # Find unique IBs and their associated VB resources
     ib_set = set()
@@ -1063,7 +1067,7 @@ def load_mesh_data(resolved, draw_calls, mirror_x=False, mirror_y=False, mirror_
         positions = []
         if pos_res and _resolve_lookup(resolved, pos_res):
             r = _resolve_lookup(resolved, pos_res)
-            positions = read_positions(r['path'], r['stride'], mirror_x=mirror_x, mirror_y=mirror_y, mirror_z=mirror_z, rot_x=rot_x, rot_y=rot_y, rot_z=rot_z)
+            positions = read_positions(r['path'], r['stride'], mirror_x=mirror_x, mirror_y=mirror_y, mirror_z=mirror_z, rot_x=rot_x, rot_y=rot_y, rot_z=rot_z, scale=scale)
 
         uvs = []
         if uv_res and _resolve_lookup(resolved, uv_res):
@@ -1628,6 +1632,20 @@ class IMPORT_OT_3dmigoto(bpy.types.Operator, ImportHelper):
     split_parts: BoolProperty(name="分离部件 / Split Into Parts", default=True)
     load_textures: BoolProperty(name="加载贴图 / Load Textures", default=True)
     load_special_textures: BoolProperty(name="启用特殊贴图 / Enable Special Textures", default=False, description="导入LightMap、Normal、FX等特殊贴图（Diffuse始终加载）")
+    import_scale: bpy.props.FloatProperty(
+        name="缩放比例 / Scale",
+        description="导入模型的缩放比例，游戏模型单位与Blender不同时调整 / Scale factor for imported model",
+        default=1.0,
+        min=0.001,
+        max=1000.0,
+        step=10,
+        precision=3,
+    )
+    auto_scale: BoolProperty(
+        name="自动缩放 / Auto Scale",
+        description="根据模型包围盒自动估算比例，缩放到约1.7m人形高度 / Auto-estimate scale from bounding box, target ~1.7m humanoid height",
+        default=False,
+    )
     game_format: bpy.props.EnumProperty(
         name="游戏 / Game",
         items=[
@@ -1806,7 +1824,46 @@ class IMPORT_OT_3dmigoto(bpy.types.Operator, ImportHelper):
             print(f"  [Migoto] Game format: {game_fmt}")
 
         # Load mesh data per IB
-        mesh_data = load_mesh_data(resolved, draw_calls, mirror_x=self.mirror_x, mirror_y=self.mirror_y, mirror_z=self.mirror_z, rot_x=self.rot_x, rot_y=self.rot_y, rot_z=self.rot_z, uv_format=self.uv_format, game_format=game_fmt)
+        mesh_data = load_mesh_data(resolved, draw_calls, mirror_x=self.mirror_x, mirror_y=self.mirror_y, mirror_z=self.mirror_z, rot_x=self.rot_x, rot_y=self.rot_y, rot_z=self.rot_z, uv_format=self.uv_format, game_format=game_fmt, scale=1.0)
+
+        # --- Auto-scale & effective scale ---
+        # Game-specific default scales (game engine coordinate units -> Blender meters)
+        GAME_DEFAULT_SCALE = {
+            'ww': 0.01,   # Wuthering Waves (Unreal Engine, cm -> m)
+            'ef': 0.01,   # Endfield (Unreal Engine, cm -> m)
+        }
+        effective_scale = self.import_scale
+
+        # Apply game-specific default scale if import_scale is at default (1.0)
+        if self.import_scale == 1.0 and game_fmt in GAME_DEFAULT_SCALE:
+            effective_scale = GAME_DEFAULT_SCALE[game_fmt]
+            print(f"  [Migoto] Game default scale ({game_fmt}): {effective_scale}")
+
+        if self.auto_scale:
+            import numpy as np
+            all_pos = []
+            for _ib, _md in mesh_data.items():
+                if _md.get('positions'):
+                    all_pos.extend(_md['positions'])
+            if all_pos:
+                pos_arr = np.array(all_pos, dtype=np.float32)
+                bbox_min = pos_arr.min(axis=0)
+                bbox_max = pos_arr.max(axis=0)
+                bbox_size = bbox_max - bbox_min
+                # Use the largest axis as height reference
+                height = float(bbox_size.max())
+                target_height = 1.7  # meters, approximate humanoid height
+                if height > 1e-6:
+                    auto_factor = target_height / height
+                    effective_scale *= auto_factor
+                    print(f"  [Migoto] Auto-scale: bbox={bbox_size[0]:.3f} x {bbox_size[1]:.3f} x {bbox_size[2]:.3f}, max={height:.3f} -> {target_height}m, factor={auto_factor:.6f}")
+
+        if effective_scale != 1.0:
+            import numpy as np
+            for _ib, _md in mesh_data.items():
+                if _md.get('positions'):
+                    _md['positions'] = [(x * effective_scale, y * effective_scale, z * effective_scale) for x, y, z in _md['positions']]
+            print(f"  [Migoto] Applied scale: {effective_scale:.6f}")
 
         print(f"  [Migoto] Mesh data loaded: {len(mesh_data)} IBs")
 
@@ -2582,6 +2639,38 @@ class MIGOTO_PG_mesh_groups(bpy.types.PropertyGroup):
     """所有分组"""
     groups: bpy.props.CollectionProperty(type=MIGOTO_PG_mesh_group)
     active_group: bpy.props.IntProperty(name="Active Group", default=0)
+
+
+class MIGOTO_PG_bone_item(bpy.types.PropertyGroup):
+    """骨骼列表项"""
+    name: bpy.props.StringProperty(name="Bone Name")
+    is_mmd: bpy.props.BoolProperty(name="Is MMD", default=False)
+
+
+class MIGOTO_UL_bone_list(bpy.types.UIList):
+    """骨骼列表（带滚动条）"""
+    bl_idname = "MIGOTO_UL_bone_list"
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_property, index):
+        if self.layout_type in {'DEFAULT', 'COMPACT'}:
+            row = layout.row(align=True)
+            bone_icon = 'CHECKBOX_HLT' if item.is_mmd else 'ERROR'
+            row.label(text=item.name, icon=bone_icon)
+            # Select button
+            op = row.operator('migoto.select_bone', text='', icon='BONE_DATA')
+            op.bone_name = item.name
+            arm = context.active_object
+            if arm and arm.type == 'ARMATURE':
+                op.armature_name = arm.name
+            # Delete button for non-MMD bones
+            if not item.is_mmd:
+                op = row.operator('migoto.delete_bone', text='', icon='TRASH')
+                op.bone_name = item.name
+                if arm and arm.type == 'ARMATURE':
+                    op.armature_name = arm.name
+        elif self.layout_type == 'GRID':
+            layout.alignment = 'CENTER'
+            layout.label(text=item.name)
 
 
 class MIGOTO_OT_add_group(bpy.types.Operator):
@@ -4271,6 +4360,49 @@ class MIGOTO_OT_delete_bone(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class MIGOTO_OT_refresh_bones(bpy.types.Operator):
+    """刷新骨骼列表 / Refresh bone list"""
+    bl_idname = "migoto.refresh_bones"
+    bl_label = "刷新骨骼列表 / Refresh Bones"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        arm = None
+        if context.active_object and context.active_object.type == 'ARMATURE':
+            arm = context.active_object
+        else:
+            for o in context.selected_objects:
+                if o.type == 'ARMATURE':
+                    arm = o
+                    break
+        if not arm:
+            self.report({'ERROR'}, '请选中一个骨架')
+            return {'CANCELLED'}
+
+        scene = context.scene
+        search_text = scene.migoto_bone_search.lower().strip()
+        scene.migoto_bones.clear()
+        scene.migoto_other_bones.clear()
+        mmd_count = 0
+        other_count = 0
+        for bone in arm.data.bones:
+            if search_text and search_text not in bone.name.lower():
+                continue
+            if is_mmd_bone(bone.name):
+                item = scene.migoto_bones.add()
+                item.name = bone.name
+                item.is_mmd = True
+                mmd_count += 1
+            else:
+                item = scene.migoto_other_bones.add()
+                item.name = bone.name
+                item.is_mmd = False
+                other_count += 1
+
+        self.report({'INFO'}, f'MMD: {mmd_count}, 其他: {other_count}')
+        return {'FINISHED'}
+
+
 class MIGOTO_OT_delete_all_non_mmd(bpy.types.Operator):
     """删除所有非MMD骨骼 / Delete all non-MMD bones"""
     bl_idname = "migoto.delete_all_non_mmd"
@@ -4288,35 +4420,14 @@ class MIGOTO_OT_delete_all_non_mmd(bpy.types.Operator):
             self.report({'ERROR'}, '请选中一个骨架')
             return {'CANCELLED'}
 
-        mmd_names = {
-            'センター', 'Center', '下半身', 'LowerBody', '上半身', 'UpperBody',
-            '上半身2', 'UpperBody2', '首', 'Neck', '頭', 'Head',
-            '左腕', 'LeftArm', '左ひじ', 'LeftElbow', '左手首', 'LeftWrist',
-            '右腕', 'RightArm', '右ひじ', 'RightElbow', '右手首', 'RightWrist',
-            '左足', 'LeftLeg', '左ひざ', 'LeftKnee', '左足首', 'LeftAnkle',
-            '左つま先', 'LeftToe', '右足', 'RightLeg', '右ひざ', 'RightKnee',
-            '右足首', 'RightAnkle', '右つま先', 'RightToe',
-            '左親指', 'LeftThumb', '左人指', 'LeftIndex', '左中指', 'LeftMiddle',
-            '左薬指', 'LeftRing', '左小指', 'LeftPinky',
-            '右親指', 'RightThumb', '右人指', 'RightIndex', '右中指', 'RightMiddle',
-            '右薬指', 'RightRing', '右小指', 'RightPinky',
-            '左足ＩＫ', 'LeftFootIK', '右足ＩＫ', 'RightFootIK',
-            '左肩', 'LeftShoulder', '右肩', 'RightShoulder',
-            '左目', 'LeftEye', '右目', 'RightEye', '両目', 'BothEyes',
-            '腰', 'Waist', '胸', 'Chest',
-        }
+        mmd_names = MMD_BONE_NAMES
+        mmd_prefixes = MMD_BONE_PREFIXES
 
         context.view_layer.objects.active = arm
         bpy.ops.object.mode_set(mode='EDIT')
         to_delete = []
         for bone in arm.data.edit_bones:
-            is_mmd = bone.name in mmd_names
-            if not is_mmd:
-                for mmd in mmd_names:
-                    if mmd in bone.name and len(mmd) > 2:
-                        is_mmd = True
-                        break
-            if not is_mmd:
+            if not is_mmd_bone(bone.name):
                 to_delete.append(bone)
         for bone in to_delete:
             arm.data.edit_bones.remove(bone)
@@ -4325,32 +4436,184 @@ class MIGOTO_OT_delete_all_non_mmd(bpy.types.Operator):
         return {'FINISHED'}
 
 
+# MMD standard bone names (from PMX/PMX spec + bone group rules)
+# Includes Japanese, standard English, and common alternative English names
 MMD_BONE_NAMES = {
-    'センター', 'Center', '下半身', 'LowerBody', '上半身', 'UpperBody',
-    '上半身2', 'UpperBody2', '首', 'Neck', '頭', 'Head',
-    '左腕', 'LeftArm', '左ひじ', 'LeftElbow', '左手首', 'LeftWrist',
-    '右腕', 'RightArm', '右ひじ', 'RightElbow', '右手首', 'RightWrist',
-    '左足', 'LeftLeg', '左ひざ', 'LeftKnee', '左足首', 'LeftAnkle',
-    '左つま先', 'LeftToe', '右足', 'RightLeg', '右ひざ', 'RightKnee',
-    '右足首', 'RightAnkle', '右つま先', 'RightToe',
-    '左親指', 'LeftThumb', '左人指', 'LeftIndex', '左中指', 'LeftMiddle',
-    '左薬指', 'LeftRing', '左小指', 'LeftPinky',
-    '右親指', 'RightThumb', '右人指', 'RightIndex', '右中指', 'RightMiddle',
-    '右薬指', 'RightRing', '右小指', 'RightPinky',
-    '左足ＩＫ', 'LeftFootIK', '右足ＩＫ', 'RightFootIK',
-    '左肩', 'LeftShoulder', '右肩', 'RightShoulder',
-    '左目', 'LeftEye', '右目', 'RightEye', '両目', 'BothEyes',
-    '腰', 'Waist', '胸', 'Chest',
+    # --- Root / センター group ---
+    '全ての親', 'mother',
+    'グルーブ', 'groove',
+    'センター', 'center',
+    '腰', 'waist',
+    # --- Upper Body / 体(上) group (includes head & neck) ---
+    '上半身', 'upper body', 'UpperBody',
+    '上半身2', 'upper body2', 'UpperBody2',
+    '胸', 'chest', 'Chest',
+    '首', 'neck', 'Neck',
+    '頭', 'head', 'Head',
+    # --- Lower Body / 体(下) group ---
+    '下半身', 'lower body', 'LowerBody',
+    # --- Arms / 腕 group ---
+    '左肩', 'shoulder L', 'LeftShoulder', 'Shoulder.L',
+    '右肩', 'shoulder R', 'RightShoulder', 'Shoulder.R',
+    '左腕', 'arm L', 'LeftArm', 'Arm.L', '腕.L',
+    '右腕', 'arm R', 'RightArm', 'Arm.R', '腕.R',
+    '左ひじ', 'elbow L', 'LeftElbow', 'Elbow.L', 'ひじ.L',
+    '右ひじ', 'elbow R', 'RightElbow', 'Elbow.R', 'ひじ.R',
+    '左手首', 'wrist L', 'LeftWrist', 'Wrist.L', '手首.L',
+    '右手首', 'wrist R', 'RightWrist', 'Wrist.R', '手首.R',
+    # --- Fingers / 指 group (with numbered variants) ---
+    '左親指', 'thumb L', 'LeftThumb', 'Thumb.L', '親指.L',
+    '左親指１', 'thumb1L', 'LeftThumb1', 'Thumb1.L', '親指１.L',
+    '左親指２', 'thumb2L', 'LeftThumb2', 'Thumb2.L', '親指２.L',
+    '右親指', 'thumb R', 'RightThumb', 'Thumb.R', '親指.R',
+    '右親指１', 'thumb1R', 'RightThumb1', 'Thumb1.R', '親指１.R',
+    '右親指２', 'thumb2R', 'RightThumb2', 'Thumb2.R', '親指２.R',
+    '左人指', 'fore L', 'LeftIndex', 'Index.L', '人指.L',
+    '左人指１', 'fore1L', 'LeftIndex1', 'Index1.L', '人指１.L',
+    '左人指２', 'fore2L', 'LeftIndex2', 'Index2.L', '人指２.L',
+    '左人指３', 'fore3L', 'LeftIndex3', 'Index3.L', '人指３.L',
+    '右人指', 'fore R', 'RightIndex', 'Index.R', '人指.R',
+    '右人指１', 'fore1R', 'RightIndex1', 'Index1.R', '人指１.R',
+    '右人指２', 'fore2R', 'RightIndex2', 'Index2.R', '人指２.R',
+    '右人指３', 'fore3R', 'RightIndex3', 'Index3.R', '人指３.R',
+    '左中指', 'middle L', 'LeftMiddle', 'Middle.L', '中指.L',
+    '左中指１', 'middle1L', 'LeftMiddle1', 'Middle1.L', '中指１.L',
+    '左中指２', 'middle2L', 'LeftMiddle2', 'Middle2.L', '中指２.L',
+    '左中指３', 'middle3L', 'LeftMiddle3', 'Middle3.L', '中指３.L',
+    '右中指', 'middle R', 'RightMiddle', 'Middle.R', '中指.R',
+    '右中指１', 'middle1R', 'RightMiddle1', 'Middle1.R', '中指１.R',
+    '右中指２', 'middle2R', 'RightMiddle2', 'Middle2.R', '中指２.R',
+    '右中指３', 'middle3R', 'RightMiddle3', 'Middle3.R', '中指３.R',
+    '左薬指', 'third L', 'LeftRing', 'Ring.L', '薬指.L',
+    '左薬指１', 'third1L', 'LeftRing1', 'Ring1.L', '薬指１.L',
+    '左薬指２', 'third2L', 'LeftRing2', 'Ring2.L', '薬指２.L',
+    '左薬指３', 'third3L', 'LeftRing3', 'Ring3.L', '薬指３.L',
+    '右薬指', 'third R', 'RightRing', 'Ring.R', '薬指.R',
+    '右薬指１', 'third1R', 'RightRing1', 'Ring1.R', '薬指１.R',
+    '右薬指２', 'third2R', 'RightRing2', 'Ring2.R', '薬指２.R',
+    '右薬指３', 'third3R', 'RightRing3', 'Ring3.R', '薬指３.R',
+    '左小指', 'little L', 'LeftPinky', 'Little.L', '小指.L',
+    '左小指１', 'little1L', 'LeftPinky1', 'Little1.L', '小指１.L',
+    '左小指２', 'little2L', 'LeftPinky2', 'Little2.L', '小指２.L',
+    '左小指３', 'little3L', 'LeftPinky3', 'Little3.L', '小指３.L',
+    '右小指', 'little R', 'RightPinky', 'Little.R', '小指.R',
+    '右小指１', 'little1R', 'RightPinky1', 'Little1.R', '小指１.R',
+    '右小指２', 'little2R', 'RightPinky2', 'Little2.R', '小指２.R',
+    '右小指３', 'little3R', 'RightPinky3', 'Little3.R', '小指３.R',
+    # --- Legs / 足 group ---
+    '左足', 'leg L', 'LeftLeg', 'Leg.L', '足.L',
+    '右足', 'leg R', 'RightLeg', 'Leg.R', '足.R',
+    '左ひざ', 'knee L', 'LeftKnee', 'Knee.L', 'ひざ.L',
+    '右ひざ', 'knee R', 'RightKnee', 'Knee.R', 'ひざ.R',
+    '左足首', 'ankle L', 'LeftAnkle', 'Ankle.L', '足首.L',
+    '右足首', 'ankle R', 'RightAnkle', 'Ankle.R', '足首.R',
+    '左つま先', 'toe L', 'LeftToe', 'Toe.L', 'つま先.L',
+    '右つま先', 'toe R', 'RightToe', 'Toe.R', 'つま先.R',
+    # --- IK Bones / ＩＫ group ---
+    '左足ＩＫ', 'leg IK L', 'LeftFootIK', 'LegIK.L', '足ＩＫ.L',
+    '右足ＩＫ', 'leg IK R', 'RightFootIK', 'LegIK.R', '足ＩＫ.R',
+    '左つま先ＩＫ', 'toe IK L', 'LeftToeIK', 'ToeIK.L', 'つま先ＩＫ.L',
+    '右つま先ＩＫ', 'toe IK R', 'RightToeIK', 'ToeIK.R', 'つま先ＩＫ.R',
+    # --- Eyes / その他 group ---
+    '左目', 'eye L', 'LeftEye', 'Eye.L', '目.L',
+    '右目', 'eye R', 'RightEye', 'Eye.R', '目.R',
+    '両目', 'eyes', 'BothEyes', 'Eyes',
+    # --- Teeth & Tongue ---
+    '歯', 'teeth', '舌', 'tongue',
+}
+
+# MMD bone name prefixes for prefix-based matching
+# Used to match numbered variants (e.g., 左親指１ matches 左親指)
+MMD_BONE_PREFIXES = {
+    # Japanese prefixes (bare names without 左/右)
+    '全ての親', 'グルーブ', 'センター', '腰',
+    '上半身', '下半身', '首', '頭', '胸',
+    '肩', '腕', 'ひじ', '手首',
+    '親指', '人指', '中指', '薬指', '小指',
+    '足', 'ひざ', '足首', 'つま先',
+    '足ＩＫ', 'つま先ＩＫ', '目', '歯', '舌',
+    # Japanese prefixes (with 左/右)
+    '左肩', '右肩', '左腕', '右腕', '左ひじ', '右ひじ', '左手首', '右手首',
+    '左親指', '右親指', '左人指', '右人指', '左中指', '右中指',
+    '左薬指', '右薬指', '左小指', '右小指',
+    '左足', '右足', '左ひざ', '右ひざ', '左足首', '右足首', '左つま先', '右つま先',
+    '左足ＩＫ', '右足ＩＫ', '左つま先ＩＫ', '右つま先ＩＫ',
+    '左目', '右目', '両目',
+    # English prefixes
+    'mother', 'groove', 'center', 'waist',
+    'upper body', 'lower body', 'neck', 'head', 'chest',
+    'shoulder L', 'shoulder R', 'arm L', 'arm R',
+    'elbow L', 'elbow R', 'wrist L', 'wrist R',
+    'thumb', 'fore', 'middle', 'third', 'little',
+    'leg L', 'leg R', 'knee L', 'knee R',
+    'ankle L', 'ankle R', 'toe L', 'toe R',
+    'leg IK L', 'leg IK R', 'toe IK L', 'toe IK R',
+    'eye L', 'eye R', 'eyes', 'teeth', 'tongue',
+    # CamelCase alternatives
+    'UpperBody', 'LowerBody',
+    'Shoulder', 'LeftShoulder', 'RightShoulder',
+    'Arm', 'LeftArm', 'RightArm',
+    'Elbow', 'LeftElbow', 'RightElbow',
+    'Wrist', 'LeftWrist', 'RightWrist',
+    'Thumb', 'LeftThumb', 'RightThumb',
+    'Index', 'LeftIndex', 'RightIndex',
+    'Middle', 'LeftMiddle', 'RightMiddle',
+    'Ring', 'LeftRing', 'RightRing',
+    'Pinky', 'LeftPinky', 'RightPinky',
+    'Leg', 'LeftLeg', 'RightLeg',
+    'Knee', 'LeftKnee', 'RightKnee',
+    'Ankle', 'LeftAnkle', 'RightAnkle',
+    'Toe', 'LeftToe', 'RightToe',
+    'FootIK', 'LeftFootIK', 'RightFootIK',
+    'ToeIK', 'LeftToeIK', 'RightToeIK',
+    'Eye', 'LeftEye', 'RightEye', 'BothEyes',
+    # MMDtools .L/.R suffix format (English)
+    'Shoulder.L', 'Shoulder.R', 'Arm.L', 'Arm.R',
+    'Elbow.L', 'Elbow.R', 'Wrist.L', 'Wrist.R',
+    'Thumb.L', 'Thumb.R', 'Index.L', 'Index.R',
+    'Middle.L', 'Middle.R', 'Ring.L', 'Ring.R',
+    'Little.L', 'Little.R',
+    'Leg.L', 'Leg.R', 'Knee.L', 'Knee.R',
+    'Ankle.L', 'Ankle.R', 'Toe.L', 'Toe.R',
+    'LegIK.L', 'LegIK.R', 'ToeIK.L', 'ToeIK.R',
+    'Eye.L', 'Eye.R', 'Eyes',
+    # MMDtools .L/.R suffix format (Japanese)
+    '腕.L', '腕.R', 'ひじ.L', 'ひじ.R', '手首.L', '手首.R',
+    '親指.L', '親指.R', '人指.L', '人指.R', '中指.L', '中指.R',
+    '薬指.L', '薬指.R', '小指.L', '小指.R',
+    '足.L', '足.R', 'ひざ.L', 'ひざ.R', '足首.L', '足首.R',
+    'つま先.L', 'つま先.R', '足ＩＫ.L', '足ＩＫ.R',
+    'つま先ＩＫ.L', 'つま先ＩＫ.R', '目.L', '目.R',
 }
 
 
 def is_mmd_bone(name):
-    """Check if a bone name is MMD standard."""
-    if name in MMD_BONE_NAMES:
-        return True
-    for mmd in MMD_BONE_NAMES:
-        if mmd in name and len(mmd) > 2:
+    """Check if a bone name is MMD standard.
+    Handles exact match, prefix match (numbered variants),
+    D/EX suffixes (physics/extension bones),
+    and .L/.R suffixes (MMDtools rename)."""
+    def _check(n):
+        """Core check: exact + prefix match."""
+        if n in MMD_BONE_NAMES:
             return True
+        for prefix in MMD_BONE_PREFIXES:
+            if n.startswith(prefix) and len(n) <= len(prefix) + 3:
+                return True
+        return False
+
+    # 1. Direct check
+    if _check(name):
+        return True
+    # 2. Strip D/EX suffix and check again
+    #    Handles: 左腕D, 腕.L+D -> 腕D.L, ArmD.L, ArmEX.R, etc.
+    for suffix in ('D', 'EX'):
+        if name.endswith(suffix):
+            if _check(name[:-len(suffix)]):
+                return True
+        for lr in ('.L', '.R'):
+            if name.endswith(suffix + lr):
+                if _check(name[:-(len(suffix) + len(lr))]):
+                    return True
     return False
 
 
@@ -4375,40 +4638,52 @@ class MIGOTO_PT_bone_manager(bpy.types.Panel):
                     break
 
         if not arm:
-            layout.label(text='请选中一个骨架 / Select an armature')
+            layout.label(text='请选中一个骨架 / Select an armature', icon='INFO')
             return
 
+        # Header: armature info
         layout.label(text=f'骨架: {arm.name} ({len(arm.data.bones)} 根骨骼)', icon='ARMATURE_DATA')
+
+        # Action buttons
         row = layout.row(align=True)
         row.scale_y = 1.3
-        row.operator('migoto.delete_all_non_mmd', text='🗑️ 删除非MMD骨骼', icon='TRASH')
-        layout.separator()
+        row.operator('migoto.refresh_bones', text='🔄 刷新骨骼列表', icon='FILE_REFRESH')
+        row.operator('migoto.delete_all_non_mmd', text='🗑️ 删除非MMD', icon='TRASH')
+        row.operator('migoto.import_pmx_skeleton', text='📥 提取MMD骨架', icon='ARMATURE_DATA')
 
-        mmd_bones = [b for b in arm.data.bones if is_mmd_bone(b.name)]
-        other_bones = [b for b in arm.data.bones if not is_mmd_bone(b.name)]
+        # Search filter + refresh
+        search_row = layout.row(align=True)
+        search_row.prop(context.scene, 'migoto_bone_search', text='', icon='VIEWZOOM')
+        search_row.operator('migoto.refresh_bones', text='', icon='FILE_REFRESH')
 
+        mmd_bones = context.scene.migoto_bones
+        other_bones = context.scene.migoto_other_bones
+
+        # MMD bones section
         box = layout.box()
         box.label(text=f'MMD 标准骨骼 ({len(mmd_bones)})', icon='CHECKBOX_HLT')
-        for bone in mmd_bones[:30]:
-            row = box.row(align=True)
-            op = row.operator('migoto.select_bone', text=bone.name, icon='BONE_DATA')
-            op.bone_name = bone.name
-            op.armature_name = arm.name
-        if len(mmd_bones) > 30:
-            box.label(text=f'... 还有 {len(mmd_bones) - 30} 根', icon='INFO')
+        if len(mmd_bones) > 0:
+            box.template_list(
+                'MIGOTO_UL_bone_list', '',
+                context.scene, 'migoto_bones',
+                context.scene, 'migoto_bone_index',
+                rows=min(len(mmd_bones), 10),
+            )
+        else:
+            box.label(text='无 / None', icon='INFO')
 
+        # Other bones section
         box = layout.box()
         box.label(text=f'其他骨骼 ({len(other_bones)}) — 可删除', icon='ERROR')
-        for bone in other_bones[:30]:
-            row = box.row(align=True)
-            op = row.operator('migoto.select_bone', text=bone.name, icon='BONE_DATA')
-            op.bone_name = bone.name
-            op.armature_name = arm.name
-            op = row.operator('migoto.delete_bone', text='', icon='TRASH')
-            op.bone_name = bone.name
-            op.armature_name = arm.name
-        if len(other_bones) > 30:
-            box.label(text=f'... 还有 {len(other_bones) - 30} 根', icon='INFO')
+        if len(other_bones) > 0:
+            box.template_list(
+                'MIGOTO_UL_bone_list', '',
+                context.scene, 'migoto_other_bones',
+                context.scene, 'migoto_other_bone_index',
+                rows=min(len(other_bones), 10),
+            )
+        else:
+            box.label(text='无 / None', icon='INFO')
 
 
 class MIGOTO_PT_vertex_groups(bpy.types.Panel):
@@ -4433,7 +4708,6 @@ class MIGOTO_PT_vertex_groups(bpy.types.Panel):
         row.scale_y = 1.2
         row.operator('migoto.auto_bind_by_position', text='🤖 自动匹配 / Auto Match', icon='MOD_VERTEX_WEIGHT')
         row.operator('migoto.generate_skeleton', text='⚡ 生成骨骼(实验性)', icon='ARMATURE_DATA')
-        row.operator('migoto.import_pmx_skeleton', text='📥 提取MMD骨架', icon='ARMATURE_DATA')
         layout.separator()
 
         # Show exit button if in weight paint mode
@@ -4484,6 +4758,8 @@ classes = (
     MIGOTO_PG_mesh_group_item,
     MIGOTO_PG_mesh_group,
     MIGOTO_PG_mesh_groups,
+    MIGOTO_PG_bone_item,
+    MIGOTO_UL_bone_list,
     MIGOTO_OT_load_textures,
     MIGOTO_OT_apply_texture,
     MIGOTO_OT_apply_texture_from_list,
@@ -4525,6 +4801,7 @@ classes = (
     MIGOTO_OT_auto_bind_by_position,
     MIGOTO_OT_import_pmx_skeleton,
     MIGOTO_OT_select_bone,
+    MIGOTO_OT_refresh_bones,
     MIGOTO_OT_delete_bone,
     MIGOTO_OT_delete_all_non_mmd,
     MIGOTO_PT_bone_manager,
@@ -4542,6 +4819,11 @@ def register():
     bpy.types.Scene.migoto_textures = bpy.props.CollectionProperty(type=MIGOTO_PG_texture_item)
     bpy.types.Scene.migoto_tex_state = bpy.props.PointerProperty(type=MIGOTO_PG_texture_state)
     bpy.types.Scene.migoto_game_toggles = bpy.props.PointerProperty(type=MIGOTO_PG_game_toggles)
+    bpy.types.Scene.migoto_bone_search = bpy.props.StringProperty(name="搜索骨骼 / Search Bone", default='', description="按名称过滤骨骼列表 / Filter bone list by name")
+    bpy.types.Scene.migoto_bones = bpy.props.CollectionProperty(type=MIGOTO_PG_bone_item)
+    bpy.types.Scene.migoto_bone_index = bpy.props.IntProperty(default=0)
+    bpy.types.Scene.migoto_other_bones = bpy.props.CollectionProperty(type=MIGOTO_PG_bone_item)
+    bpy.types.Scene.migoto_other_bone_index = bpy.props.IntProperty(default=0)
 
 
 def unregister():
@@ -4552,6 +4834,11 @@ def unregister():
     del bpy.types.Scene.migoto_textures
     del bpy.types.Scene.migoto_tex_state
     del bpy.types.Scene.migoto_game_toggles
+    del bpy.types.Scene.migoto_bone_search
+    del bpy.types.Scene.migoto_bones
+    del bpy.types.Scene.migoto_bone_index
+    del bpy.types.Scene.migoto_other_bones
+    del bpy.types.Scene.migoto_other_bone_index
     # Clean up preview collections
     for pcoll in _preview_collections.values():
         bpy.utils.previews.remove(pcoll)
