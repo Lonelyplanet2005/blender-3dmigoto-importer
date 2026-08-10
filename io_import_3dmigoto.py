@@ -265,19 +265,167 @@ def read_indices(filepath, format=''):
         return indices32
 
 
-def read_blend_weights(filepath, stride=32):
+def read_blend_weights(filepath, stride=32, byte_offset=0):
     """Read blend weights from buffer.
-    Format: 4 x float32 weights + bone indices (offset varies by game/component).
+    Supports multiple formats:
+    - float32 weights + uint32 bone indices (stride 32+, XXMI/Genshin/StarRail/ZZZ)
+    - R8_UINT: uint8 bone indices + uint8 weights (stride 8 or 16, Wuthering Waves vb4)
+    - uint8 bone indices only (stride 4, Endfield VB1 after UV data)
+    byte_offset: skip N bytes at the start of each vertex's stride (for EF UV+blend in same buffer)
     Returns list of [(bone_idx, weight), ...] per vertex.
     """
     if not filepath or not os.path.exists(filepath):
         return []
     with open(filepath, 'rb') as f:
         data = f.read()
+    # Effective stride is the full stride, but we read from byte_offset within each stride
     n = len(data) // stride
     if n == 0:
         return []
 
+    # Detect R8_UINT format (Wuthering Waves: stride 8 or 16, all uint8)
+    # Heuristic: small stride (<=16) with no valid float32 weights at offset 0
+    is_r8_format = False
+    if stride <= 16:
+        # Check if first 4 bytes look like valid float32 data
+        # If they're uint8 bone indices (0-200), interpreting as float32 gives
+        # denormalized or extremely tiny values that are never real position/weight data
+        sample_valid = 0
+        sample_tiny = 0
+        for i in range(min(100, n)):
+            try:
+                raw = struct.unpack_from('<I', data, i * stride + byte_offset)[0]
+                w0 = struct.unpack_from('<f', data, i * stride + byte_offset)[0]
+                if 0.0 <= w0 <= 1.0:
+                    sample_valid += 1
+                # Check for denormalized floats (exponent=0, mantissa!=0)
+                exp = (raw >> 23) & 0xFF
+                mant = raw & 0x007FFFFF
+                if exp == 0 and mant != 0:
+                    sample_tiny += 1
+                # Also check for extremely small normalized floats (exp 1-10)
+                # These are < ~1e-30, never real blend weights
+                elif 1 <= exp <= 10:
+                    sample_tiny += 1
+            except Exception:
+                pass
+        # If many values are tiny floats, it's uint8/uint16 data misread as float32
+        if sample_tiny > 20 or sample_valid < 30:
+            is_r8_format = True
+
+    if is_r8_format:
+        # Try multiple interpretations and pick the best one
+        blend_bytes = stride - byte_offset
+
+        # Format A: R8_UINT (bone indices + weights as uint8 pairs)
+        half = blend_bytes // 2
+        result_a = []
+        non_empty_a = 0
+        for i in range(n):
+            offset = i * stride + byte_offset
+            vert_weights = []
+            for j in range(half):
+                if offset + j >= len(data):
+                    break
+                bone_idx = data[offset + j]
+                w_offset = offset + half + j
+                if w_offset >= len(data):
+                    break
+                weight = data[w_offset] / 255.0
+                if weight > 0.001 and bone_idx > 0:
+                    vert_weights.append((bone_idx, weight))
+            if vert_weights:
+                non_empty_a += 1
+            result_a.append(vert_weights)
+
+        # Format B: uint8 bone indices only (equal weights)
+        result_b = []
+        non_empty_b = 0
+        for i in range(n):
+            offset = i * stride + byte_offset
+            vert_weights = []
+            for j in range(blend_bytes):
+                if offset + j >= len(data):
+                    break
+                bone_idx = data[offset + j]
+                if bone_idx > 0:
+                    vert_weights.append((bone_idx, 1.0 / max(blend_bytes, 1)))
+            if vert_weights:
+                non_empty_b += 1
+            result_b.append(vert_weights)
+
+        # Format C: uint16 bone indices only (equal weights)
+        result_c = []
+        non_empty_c = 0
+        num_bones_c = blend_bytes // 2
+        if num_bones_c >= 1:
+            for i in range(n):
+                offset = i * stride + byte_offset
+                vert_weights = []
+                for j in range(num_bones_c):
+                    b_off = offset + j * 2
+                    if b_off + 2 > len(data):
+                        break
+                    bone_idx = struct.unpack_from('<H', data, b_off)[0]
+                    if bone_idx > 0:
+                        vert_weights.append((bone_idx, 1.0 / max(num_bones_c, 1)))
+                if vert_weights:
+                    non_empty_c += 1
+                result_c.append(vert_weights)
+
+        # Pick the best format: most non-empty vertices wins
+        best = max([(non_empty_a, 'R8_UINT', result_a),
+                     (non_empty_b, 'uint8 bone-only', result_b),
+                     (non_empty_c, 'uint16 bone-only', result_c)], key=lambda x: x[0])
+        print(f"  [Migoto] Blend R8_UINT: stride={stride}, offset={byte_offset}, blend_bytes={blend_bytes}")
+        print(f"    R8_UINT: {non_empty_a}/{n}, uint8 bone-only: {non_empty_b}/{n}, uint16 bone-only: {non_empty_c}/{n}")
+        print(f"    Selected: {best[1]} ({best[0]}/{n} non-empty)")
+        return best[2]
+
+    # Special case: small blend data (4-8 bytes) that didn't trigger R8_UINT
+    # Try reading as uint8 bone indices with equal weights (EF VB0 offset 12)
+    blend_bytes = stride - byte_offset
+    if 1 <= blend_bytes <= 8:
+        result = []
+        non_empty = 0
+        for i in range(n):
+            offset = i * stride + byte_offset
+            vert_weights = []
+            for j in range(blend_bytes):
+                if offset + j >= len(data):
+                    break
+                bone_idx = data[offset + j]
+                if bone_idx > 0:
+                    vert_weights.append((bone_idx, 1.0 / blend_bytes))
+            if vert_weights:
+                non_empty += 1
+            result.append(vert_weights)
+        if non_empty > n * 0.01:  # At least 1% non-empty
+            print(f"  [Migoto] Blend uint8 bone-only (fallback): stride={stride}, offset={byte_offset}, blend_bytes={blend_bytes}, verts={n}, non_empty={non_empty}")
+            return result
+        # Also try uint16 bone indices (2 bones × 2 bytes)
+        if blend_bytes >= 4:
+            result = []
+            non_empty = 0
+            num_bones = blend_bytes // 2
+            for i in range(n):
+                offset = i * stride + byte_offset
+                vert_weights = []
+                for j in range(num_bones):
+                    b_off = offset + j * 2
+                    if b_off + 2 > len(data):
+                        break
+                    bone_idx = struct.unpack_from('<H', data, b_off)[0]
+                    if bone_idx > 0:
+                        vert_weights.append((bone_idx, 1.0 / num_bones))
+                if vert_weights:
+                    non_empty += 1
+                result.append(vert_weights)
+            if non_empty > n * 0.01:
+                print(f"  [Migoto] Blend uint16 bone-only (fallback): stride={stride}, offset={byte_offset}, num_bones={num_bones}, verts={n}, non_empty={non_empty}")
+                return result
+
+    # Original float32 weight format (stride >= 32)
     # Auto-detect bone index offset
     # Bone indices are uint32 values typically in range [1, 200]
     # They appear after the 4 x float32 weights (offset >= 16)
@@ -474,11 +622,11 @@ def build_component_texture_map(ini_path, ini_dir, resolved):
     """Parse INI to build section -> texture mapping.
     Handles both WWMI (this = ResourceXXX) and 3Dmigoto (ps-t0 = ResourceXXX) formats."""
     import re as _re
-    
+
     resource_files = {}
     section_tex_refs = {}  # section_name -> [resource_names]
     current_section = None
-    
+
     with open(ini_path, 'r', encoding='utf-8', errors='ignore') as f:
         for line in f:
             s = line.strip()
@@ -489,22 +637,22 @@ def build_component_texture_map(ini_path, ini_dir, resolved):
                 continue
             key, val = s.split('=', 1)
             key, val = key.strip(), val.strip()
-            
+
             if key == 'filename' and current_section.startswith('Resource'):
                 resource_files[current_section] = val
-            
+
             # WWMI format: this = ResourceTextureN
             if key == 'this' and val.startswith('Resource'):
                 if current_section not in section_tex_refs:
                     section_tex_refs[current_section] = []
                 section_tex_refs[current_section].append(val)
-            
+
             # 3Dmigoto format: ps-t0 = ResourceXXX (diffuse)
             if key == 'ps-t0' and val.startswith('Resource'):
                 if current_section not in section_tex_refs:
                     section_tex_refs[current_section] = []
                 section_tex_refs[current_section].append(val)
-    
+
     # Build section -> texture paths
     section_textures = {}
     for section, res_names in section_tex_refs.items():
@@ -516,7 +664,7 @@ def build_component_texture_map(ini_path, ini_dir, resolved):
                     section_textures[section] = []
                 section_textures[section].append(res_data['path'])
                 continue
-            
+
             # Try resource filename
             fname = resource_files.get(res_name, '')
             if fname:
@@ -526,7 +674,7 @@ def build_component_texture_map(ini_path, ini_dir, resolved):
                         section_textures[section] = []
                     section_textures[section].append(fp)
                     continue
-            
+
             # Try to find by resource name in file system
             clean_name = res_name.replace('Resource', '')
             for f in os.listdir(ini_dir):
@@ -536,7 +684,7 @@ def build_component_texture_map(ini_path, ini_dir, resolved):
                         section_textures[section] = []
                     section_textures[section].append(fp)
                     break
-    
+
     # Also build component-based mapping (for WWMI format)
     comp_textures = {}
     for section, texs in section_tex_refs.items():
@@ -556,7 +704,7 @@ def build_component_texture_map(ini_path, ini_dir, resolved):
                             comp_textures[comp_num].append(res_data['path'])
                     except Exception:
                         pass
-    
+
     # Merge: for sections with Component in name, use comp_textures
     for section in list(section_textures.keys()):
         match = _re.search(r'Component(\\d+)', section)
@@ -564,7 +712,7 @@ def build_component_texture_map(ini_path, ini_dir, resolved):
             comp_num = int(match.group(1))
             if comp_num in comp_textures and comp_textures[comp_num]:
                 section_textures[section] = comp_textures[comp_num]
-    
+
     return section_textures
 
 
@@ -583,7 +731,7 @@ def parse_ini_full(ini_path):
         if s.startswith('[') and s.endswith(']'):
             current_section = s[1:-1]
             if current_section not in sections:
-                sections[current_section] = {'ib': None, 'vb0': None, 'vb1': None, 'vb2': None, 'draws': [], 'runs': [], 'textures': {}, 'hash': None, 'match_first_index': None, 'handling': None}
+                sections[current_section] = {'ib': None, 'vb0': None, 'vb1': None, 'vb2': None, 'vbs': {}, 'draws': [], 'runs': [], 'textures': {}, 'hash': None, 'match_first_index': None, 'handling': None}
             continue
         if not current_section:
             continue
@@ -637,6 +785,31 @@ def parse_ini_full(ini_path):
         if key == 'vb2':
             if not in_conditional or _first_assign('vb2'):
                 sections[current_section]['vb2'] = _strip_ref(val)
+        # Capture additional VB slots (vb3, vb4, vb5, etc.) for blend buffers
+        vb_match = re.match(r'^vb(\d+)$', key)
+        if vb_match:
+            vb_idx = int(vb_match.group(1))
+            if vb_idx >= 3:
+                vb_key = f'vb{vb_idx}'
+                if not in_conditional or vb_key not in sections[current_section]['vbs']:
+                    sections[current_section]['vbs'][vb_key] = _strip_ref(val)
+        # Also capture vs-t slot syntax (3Dmigoto vertex buffer slots)
+        # vs-t0 = vb0, vs-t1 = vb1, vs-t2 = vb2, vs-t3+ = additional
+        vs_match = re.match(r'^vs-t(\d+)$', key)
+        if vs_match:
+            vs_idx = int(vs_match.group(1))
+            vs_val = _strip_ref(val)
+            if vs_val and vs_val.lower().startswith('resource'):
+                if vs_idx == 0 and (not in_conditional or _first_assign('vb0')):
+                    sections[current_section]['vb0'] = vs_val
+                elif vs_idx == 1 and (not in_conditional or _first_assign('vb1')):
+                    sections[current_section]['vb1'] = vs_val
+                elif vs_idx == 2 and (not in_conditional or _first_assign('vb2')):
+                    sections[current_section]['vb2'] = vs_val
+                elif vs_idx >= 3:
+                    vb_key = f'vb{vs_idx}'
+                    if not in_conditional or vb_key not in sections[current_section]['vbs']:
+                        sections[current_section]['vbs'][vb_key] = vs_val
         if key == 'run':
             sections[current_section]['runs'].append(_strip_ref(val))
         if key == 'hash':
@@ -739,13 +912,14 @@ def parse_ini_full(ini_path):
                     })
 
     # First pass: collect IB/VB from all sections (including command lists)
-    section_res = {}  # section_name -> {ib, vb0, vb1, vb2}
+    section_res = {}  # section_name -> {ib, vb0, vb1, vb2, vbs}
     for sec_name, sec_data in sections.items():
         section_res[sec_name] = {
             'ib': sec_data['ib'],
             'vb0': sec_data['vb0'],
             'vb1': sec_data['vb1'],
             'vb2': sec_data.get('vb2'),
+            'vbs': sec_data.get('vbs', {}),
         }
 
     # Second pass: resolve run = chains (command list -> caller)
@@ -756,6 +930,7 @@ def parse_ini_full(ini_path):
             'vb0': sec_data['vb0'],
             'vb1': sec_data['vb1'],
             'vb2': sec_data.get('vb2'),
+            'vbs': sec_data.get('vbs', {}).copy(),
             'textures': sec_data['textures'].copy(),
         }
         for run_target in sec_data['runs']:
@@ -770,19 +945,23 @@ def parse_ini_full(ini_path):
                     ctx['vb1'] = cmd_res['vb1']
                 if cmd_res.get('vb2') and not ctx.get('vb2'):
                     ctx['vb2'] = cmd_res['vb2']
+                # Inherit additional VB slots (vb3+)
+                for vbk, vbv in cmd_res.get('vbs', {}).items():
+                    if vbv and vbk not in ctx.get('vbs', {}):
+                        ctx.setdefault('vbs', {})[vbk] = vbv
         # Store context for THIS section (not the target)
         caller_ctx[sec_name] = ctx
 
     # Build final draw calls
     draw_calls = []
 
-    # Global VB collection: map hash -> {vb0, vb1, vb2}
+    # Global VB collection: map hash -> {vb0, vb1, vb2, vbs}
     hash_vb_global = {}
     for sec_name, sec_data in sections.items():
         h = sec_data.get('hash')
         if not h: continue
         if h not in hash_vb_global:
-            hash_vb_global[h] = {'vb0': None, 'vb1': None, 'vb2': None}
+            hash_vb_global[h] = {'vb0': None, 'vb1': None, 'vb2': None, 'vbs': {}}
         ctx = caller_ctx.get(sec_name, {})
         v0 = sec_data['vb0'] or ctx.get('vb0')
         v1 = sec_data['vb1'] or ctx.get('vb1')
@@ -790,6 +969,13 @@ def parse_ini_full(ini_path):
         if v0 and not hash_vb_global[h]['vb0']: hash_vb_global[h]['vb0'] = v0
         if v1 and not hash_vb_global[h]['vb1']: hash_vb_global[h]['vb1'] = v1
         if v2 and not hash_vb_global[h]['vb2']: hash_vb_global[h]['vb2'] = v2
+        # Merge additional VB slots
+        for vbk, vbv in sec_data.get('vbs', {}).items():
+            if vbv and vbk not in hash_vb_global[h]['vbs']:
+                hash_vb_global[h]['vbs'][vbk] = vbv
+        for vbk, vbv in ctx.get('vbs', {}).items():
+            if vbv and vbk not in hash_vb_global[h]['vbs']:
+                hash_vb_global[h]['vbs'][vbk] = vbv
 
     # Flow 1: Sections with explicit draw calls
     for sec_name, sec_data in sections.items():
@@ -811,11 +997,21 @@ def parse_ini_full(ini_path):
             if not eff_vb1 and hash_vb_global[h]['vb1']: eff_vb1 = hash_vb_global[h]['vb1']
             if not eff_vb2 and hash_vb_global[h]['vb2']: eff_vb2 = hash_vb_global[h]['vb2']
 
+        # Merge additional VB slots from section and context
+        eff_vbs = {}
+        eff_vbs.update(ctx.get('vbs', {}))
+        eff_vbs.update(sec_data.get('vbs', {}))
+        if h and h in hash_vb_global:
+            for vbk, vbv in hash_vb_global[h].get('vbs', {}).items():
+                if vbv and vbk not in eff_vbs:
+                    eff_vbs[vbk] = vbv
+
         for dc in explicit_draws:
             dc['ib_resource'] = eff_ib
             dc['vb0_resource'] = eff_vb0
             dc['vb1_resource'] = eff_vb1
             dc['vb2_resource'] = eff_vb2
+            dc['vbs'] = eff_vbs.copy()
             dc['textures'] = eff_tex.copy()
             if 'condition' not in dc:
                 dc['condition'] = None
@@ -848,6 +1044,7 @@ def parse_ini_full(ini_path):
         vb0 = hb.get('vb0')
         vb1 = hb.get('vb1')
         vb2 = hb.get('vb2')
+        group_vbs = hb.get('vbs', {}).copy()
         if not vb0:
             for h2, hb2 in hash_vb_global.items():
                 if hb2.get('vb0'): vb0 = hb2['vb0']; break
@@ -857,6 +1054,11 @@ def parse_ini_full(ini_path):
         if not vb2:
             for h2, hb2 in hash_vb_global.items():
                 if hb2.get('vb2'): vb2 = hb2['vb2']; break
+        # Merge additional VBs from all hash entries
+        for h2, hb2 in hash_vb_global.items():
+            for vbk, vbv in hb2.get('vbs', {}).items():
+                if vbv and vbk not in group_vbs:
+                    group_vbs[vbk] = vbv
 
         # Collect textures
         hash_tex = {}
@@ -885,6 +1087,7 @@ def parse_ini_full(ini_path):
                 'index_count': index_count, 'start_index': 0, 'base_vertex': 0,
                 'ib_resource': sd['ib'],
                 'vb0_resource': vb0, 'vb1_resource': vb1, 'vb2_resource': vb2,
+                'vbs': group_vbs.copy(),
                 'textures': sd['textures'].copy(),
                 'condition': None,
             }
@@ -914,21 +1117,21 @@ def resolve_resources(ini_dir, resources):
             all_files_rel[rel] = fp
             if f not in all_files_name:
                 all_files_name[f] = fp
-    
+
     print(f"  [Migoto] resolve_resources: {len(set(all_files_rel.values()))} files in {ini_dir}")
     # Show all .buf files found
     for f in sorted(all_files_name.keys()):
         if f.endswith('.buf'):
             print(f"    Found: {f}")
-    
+
     resolved = {}
     for rname, rdata in resources.items():
         if 'filename' not in rdata:
             continue
-        
+
         fname = rdata['filename'].replace('\\', '/')
         fp = None
-        
+
         candidate = os.path.join(ini_dir, fname)
         if os.path.exists(candidate):
             fp = candidate
@@ -944,7 +1147,7 @@ def resolve_resources(ini_dir, resources):
                 if af_name.lower() == basename_lower:
                     fp = af_path
                     break
-        
+
         if fp and os.path.exists(fp):
             resolved[rname] = {
                 'path': fp,
@@ -964,7 +1167,12 @@ def resolve_resources(ini_dir, resources):
                     print(f"      Similar files found: {similar[:3]}")
                 elif not os.path.isdir(ini_dir):
                     print(f"      Directory does not exist: {ini_dir}")
-    
+
+    # Log all resolved resources for debugging
+    print(f"  [Migoto] Resolved resources ({len(resolved)}):")
+    for rname, rdata in sorted(resolved.items()):
+        print(f"    {rname}: stride={rdata['stride']}, format={rdata['format']}, type={rdata['type']}")
+
     return resolved
 
 
@@ -972,7 +1180,7 @@ def load_mesh_data(resolved, draw_calls, mirror_x=False, mirror_y=False, mirror_
     """Load vertex/UV/index data per IB."""
     # Find unique IBs and their associated VB resources
     ib_set = set()
-    ib_vb_map = {}  # ib_name -> {vb0, vb1, vb2} from draw calls
+    ib_vb_map = {}  # ib_name -> {vb0, vb1, vb2, vbs} from draw calls
     for dc in draw_calls:
         ib = dc.get('ib_resource')
         if ib:
@@ -982,6 +1190,7 @@ def load_mesh_data(resolved, draw_calls, mirror_x=False, mirror_y=False, mirror_
                     'vb0': dc.get('vb0_resource'),
                     'vb1': dc.get('vb1_resource'),
                     'vb2': dc.get('vb2_resource'),
+                    'vbs': dc.get('vbs', {}),
                 }
 
     mesh_data = {}
@@ -1039,7 +1248,7 @@ def load_mesh_data(resolved, draw_calls, mirror_x=False, mirror_y=False, mirror_
             pos_res = None
             uv_res = None
             mesh_parts = ['head', 'body', 'dress', 'hair', 'face', 'arm', 'leg', 'foot', 'hand', 'tail', 'hat', 'skirt', 'heel']
-            
+
             # Try matching with progressively shorter prefixes
             search_key = ib_hash
             for _ in range(3):
@@ -1088,44 +1297,176 @@ def load_mesh_data(resolved, draw_calls, mirror_x=False, mirror_y=False, mirror_
             uvs = read_uvs(r['path'], r['stride'], uv_format=effective_uv_fmt)
 
         # Read blend weights
-        blend_res = vb_info.get('vb2') or vb_info.get('vb1')
-        # Verify it's actually a blend buffer
-        if blend_res and _resolve_lookup(resolved, blend_res):
-            br = _resolve_lookup(resolved, blend_res)
-            blend_name_lower = (blend_res or '').lower()
-            if 'texcoord' in blend_name_lower or 'position' in blend_name_lower:
-                blend_res = None
-        # For EFMI: blend is vb1, but vb1 might also be texcoord
-        if game_format == 'ef' and blend_res:
-            br = _resolve_lookup(resolved, blend_res)
-            if br and br.get('stride', 0) not in (8, 12, 16, 32, 48, 64):
-                blend_res = None
+        # Strategy: look for blend buffer by name first (most reliable), then by slot
+        blend_res = None
+        blend_offset = 0  # byte offset within stride for blend data (EF has UV+blend in same buffer)
+        blend_stride_override = 0  # override stride for blend portion only
 
-        # Fallback: find blend buffer by name matching (XXMI/ZZZ format)
-        # IB name like 'Resource625c2692Blend' -> find matching 'Resource625c2692Blend'
-        if not blend_res or not _resolve_lookup(resolved, blend_res):
+        # Special case: Endfield blend data
+        # EF uses VB0/VB1/VB2 with varying strides per component.
+        # No explicit blend buffer in INI - must find it by analyzing binary data.
+        # Strategy: check each VB's "extra" bytes (NOT at offset 0 which is position/UV)
+        if game_format == 'ef' and not blend_res:
+            best_blend = None
+            best_score = 0
+            for vb_key in ['vb0', 'vb1', 'vb2']:
+                vb_res = vb_info.get(vb_key)
+                if not vb_res or not _resolve_lookup(resolved, vb_res):
+                    continue
+                r = _resolve_lookup(resolved, vb_res)
+                s = r.get('stride', 0)
+                if s < 4:
+                    continue
+                # Skip offset 0 (position data) - only check "extra" bytes
+                # VB0: position is 12 bytes, so start at offset 12
+                # VB1: UV is 8 bytes, so start at offset 8
+                # VB2: start at offset 0 (might be all blend data)
+                min_offset = 0
+                if vb_key == 'vb0':
+                    min_offset = 12  # skip position float32×3
+                elif vb_key == 'vb1':
+                    min_offset = 8   # skip UV float32×2
+                for offset in range(min_offset, s, 4):  # step by 4 for float32 alignment
+                    if offset >= s:
+                        continue
+                    blend_bytes = s - offset
+                    if blend_bytes < 2:
+                        continue
+                    # Quick test: read first 200 vertices and score how "blend-like" the data is
+                    try:
+                        with open(r['path'], 'rb') as tf:
+                            test_data = tf.read()
+                        test_n = min(200, len(test_data) // s)
+                        bone_like = 0
+                        has_variety = set()
+                        for ti in range(test_n):
+                            toff = ti * s + offset
+                            vert_has_bone = False
+                            for tj in range(min(blend_bytes, 8)):  # check up to 8 bytes
+                                if toff + tj >= len(test_data):
+                                    break
+                                b = test_data[toff + tj]
+                                if 0 < b <= 200:
+                                    vert_has_bone = True
+                                    has_variety.add(b)
+                            if vert_has_bone:
+                                bone_like += 1
+                        score = bone_like * min(len(has_variety), 50)
+                        if score > best_score:
+                            best_score = score
+                            best_blend = (vb_res, offset, min(blend_bytes, 8))
+                            print(f"  [Migoto] Blend: EF candidate {vb_key} offset={offset} bytes={min(blend_bytes,8)} bone_like={bone_like}/{test_n} variety={len(has_variety)} score={score}")
+                    except Exception:
+                        pass
+            if best_blend and best_score > 100:
+                blend_res, blend_offset, blend_stride_override = best_blend
+                print(f"  [Migoto] Blend: EF selected {blend_res} (offset={blend_offset}, stride={blend_stride_override})")
+            else:
+                print(f"  [Migoto] Blend: EF no suitable blend buffer found (best_score={best_score})")
+
+        # 1. Check additional VB slots (vb3+) for buffers named 'blend' or 'weight'
+        if vb_info.get('vbs'):
+            for vb_key in sorted(vb_info['vbs'].keys()):
+                vb_res_name = vb_info['vbs'][vb_key]
+                if not vb_res_name or not _resolve_lookup(resolved, vb_res_name):
+                    continue
+                rl = vb_res_name.lower()
+                if 'blend' in rl or 'weight' in rl:
+                    blend_res = vb_res_name
+                    print(f"  [Migoto] Blend: found by name in {vb_key} = {vb_res_name}")
+                    break
+
+        # 2. Check vb1/vb2 for blend by name
+        if not blend_res:
+            for candidate in [vb_info.get('vb2'), vb_info.get('vb1')]:
+                if candidate and _resolve_lookup(resolved, candidate):
+                    cl = candidate.lower()
+                    if 'blend' in cl or 'weight' in cl:
+                        blend_res = candidate
+                        print(f"  [Migoto] Blend: found by name in vb1/vb2 = {candidate}")
+                        break
+
+        # 3. Search all resolved resources for blend by name (XXMI/ZZZ format)
+        if not blend_res:
             ib_clean = ib_name.replace('Resource', '').replace('IB', '').replace('AIB', '').replace('BIB', '').replace('_', '').lower()
             for rname in resolved:
                 rl = rname.lower()
                 if 'blend' in rl:
-                    # Check if same component prefix
                     r_clean = rname.replace('Resource', '').replace('Blend', '').replace('CS', '').replace('_', '').lower()
                     if ib_clean.startswith(r_clean) or r_clean.startswith(ib_clean):
                         blend_res = rname
+                        print(f"  [Migoto] Blend: found by name matching: {rname}")
                         break
-            # Generic fallback: any blend buffer
-            if not blend_res or not _resolve_lookup(resolved, blend_res):
+            if not blend_res:
                 for rname in resolved:
-                    if 'blend' in rname.lower() and 'cs' not in rname.lower():
+                    rl = rname.lower()
+                    if ('blend' in rl or 'weight' in rl) and 'cs' not in rl:
                         blend_res = rname
+                        print(f"  [Migoto] Blend: found by generic fallback: {rname}")
                         break
+
+        # 4. Check additional VB slots by stride (less reliable, only for WW/EF)
+        if not blend_res and vb_info.get('vbs'):
+            for vb_key in sorted(vb_info['vbs'].keys()):
+                vb_res_name = vb_info['vbs'][vb_key]
+                if not vb_res_name or not _resolve_lookup(resolved, vb_res_name):
+                    continue
+                rl = vb_res_name.lower()
+                if 'texcoord' in rl or 'position' in rl:
+                    continue
+                br = _resolve_lookup(resolved, vb_res_name)
+                if br:
+                    s = br.get('stride', 0)
+                    if s in (8, 12, 16, 32, 48, 64):
+                        blend_res = vb_res_name
+                        print(f"  [Migoto] Blend: found by stride {s} in {vb_key} = {vb_res_name}")
+                        break
+
+        # 5. Last resort: for WW/EF, search all resolved resources by stride
+        # Skip for EF if special case already found blend in VB1
+        if not blend_res and game_format in ('ww', 'ef'):
+            used_res = set()
+            if pos_res: used_res.add(pos_res)
+            if uv_res: used_res.add(uv_res)
+            for rname, rdata in resolved.items():
+                if rname in used_res:
+                    continue
+                rl = rname.lower()
+                if 'position' in rl or 'texcoord' in rl or 'index' in rl:
+                    continue
+                s = rdata.get('stride', 0)
+                if s in (8, 12, 16, 32, 48, 64):
+                    blend_res = rname
+                    print(f"  [Migoto] Blend: last resort stride match: {rname} (stride={s})")
+                    break
+
+        # 6. If still not found for WW/EF, try to find ANY buffer not yet used
+        if not blend_res and game_format in ('ww', 'ef'):
+            used_res = set()
+            if pos_res: used_res.add(pos_res)
+            if uv_res: used_res.add(uv_res)
+            for rname in resolved:
+                if rname in used_res:
+                    continue
+                rl = rname.lower()
+                if 'index' in rl:
+                    continue
+                blend_res = rname
+                print(f"  [Migoto] Blend: unused resource fallback: {rname}")
+                break
 
         blend_weights = []
         if blend_res and _resolve_lookup(resolved, blend_res):
             r = _resolve_lookup(resolved, blend_res)
-            blend_weights = read_blend_weights(r['path'], r['stride'])
+            actual_stride = blend_stride_override if blend_stride_override > 0 else r['stride']
+            print(f"  [Migoto] Blend: reading {blend_res} (stride={actual_stride}, offset={blend_offset}, path={r['path']})")
+            blend_weights = read_blend_weights(r['path'], actual_stride, byte_offset=blend_offset)
             if blend_weights:
-                print(f"  [Migoto] Blend: {blend_res} ({len(blend_weights)} verts, stride={r['stride']})")
+                print(f"  [Migoto] Blend: {blend_res} ({len(blend_weights)} verts, stride={actual_stride})")
+            else:
+                print(f"  [Migoto] Blend: {blend_res} returned empty weights!")
+        else:
+            print(f"  [Migoto] Blend: NOT FOUND for {ib_name} (game_format={game_format})")
 
         mesh_data[ib_name] = {
             'positions': positions,
@@ -1379,7 +1720,7 @@ def load_dds(filepath, name):
         return None
     if name in bpy.data.images:
         return bpy.data.images[name]
-    
+
     # For non-DDS files, load directly
     if not filepath.lower().endswith('.dds'):
         try:
@@ -1388,7 +1729,7 @@ def load_dds(filepath, name):
             return img
         except Exception:
             return None
-    
+
     # Check DDS format - BC7 DDS files often have alpha=0 (mask textures)
     # Blender reads the alpha channel and makes the mesh transparent
     # Solution: convert BC7 DDS via PNG with alpha forced to 255
@@ -1422,7 +1763,7 @@ def load_dds(filepath, name):
             return img
         except Exception as e:
             print(f"  [Migoto] BC7 conversion failed: {os.path.basename(filepath)}: {e}")
-    
+
     # For other DDS formats: try Blender's native DDS loader
     try:
         img = bpy.data.images.load(filepath)
@@ -1434,7 +1775,7 @@ def load_dds(filepath, name):
         return img
     except Exception as e:
         print(f"  [Migoto] Blender DDS load failed: {os.path.basename(filepath)}: {e}")
-    
+
     # Fallback: convert DDS to PNG via Pillow
     try:
         from PIL import Image as PILImage
@@ -1471,12 +1812,12 @@ def make_material(name, diffuse=None, alpha=False, tex_assignments=None):
     bsdf = nodes.new('ShaderNodeBsdfPrincipled')
     bsdf.location = (200, 0)
     links.new(bsdf.outputs['BSDF'], out.inputs['Surface'])
-    
+
     # If we have full texture assignments, use them
     if tex_assignments:
         assign_textures_to_material(mat, tex_assignments, name_prefix=name)
         return mat
-    
+
     # Fallback: always create texture node and connect, only load image if file exists
     t = nodes.new('ShaderNodeTexImage')
     t.location = (-300, 0)
@@ -1488,7 +1829,7 @@ def make_material(name, diffuse=None, alpha=False, tex_assignments=None):
             if alpha:
                 links.new(t.outputs['Alpha'], bsdf.inputs['Alpha'])
                 mat.blend_method = 'CLIP'
-    
+
     return mat
 
 
@@ -1626,15 +1967,16 @@ class IMPORT_OT_3dmigoto(bpy.types.Operator, ImportHelper):
     mirror_x: BoolProperty(name="镜像 X 轴 / Mirror X", default=False)
     mirror_y: BoolProperty(name="镜像 Y 轴 / Mirror Y", default=False)
     mirror_z: BoolProperty(name="镜像 Z 轴 / Mirror Z", default=False)
+    flip_normals: BoolProperty(name="翻转面朝向 / Flip Normals", default=True, description="Reverse face winding to fix inverted normals (default on for WW/EF models)")
     rot_x: bpy.props.FloatProperty(name="X 旋转 / Rotate X", default=0, min=-360, max=360, step=10, subtype='ANGLE', unit='ROTATION')
     rot_y: bpy.props.FloatProperty(name="Y 旋转 / Rotate Y", default=0, min=-360, max=360, step=10, subtype='ANGLE', unit='ROTATION')
     rot_z: bpy.props.FloatProperty(name="Z 旋转 / Rotate Z", default=0, min=-360, max=360, step=10, subtype='ANGLE', unit='ROTATION')
     split_parts: BoolProperty(name="分离部件 / Split Into Parts", default=True)
     load_textures: BoolProperty(name="加载贴图 / Load Textures", default=True)
-    load_special_textures: BoolProperty(name="启用特殊贴图 / Enable Special Textures", default=False, description="导入LightMap、Normal、FX等特殊贴图（Diffuse始终加载）")
+    load_special_textures: BoolProperty(name="启用特殊贴图 / Enable Special Textures", default=False, description="导入LightMap、Normal、FX等特殊贴图(Diffuse始终加载)")
     import_scale: bpy.props.FloatProperty(
         name="缩放比例 / Scale",
-        description="导入模型的缩放比例，游戏模型单位与Blender不同时调整 / Scale factor for imported model",
+        description="导入模型的缩放比例,游戏模型单位与Blender不同时调整 / Scale factor for imported model",
         default=1.0,
         min=0.001,
         max=1000.0,
@@ -1643,25 +1985,25 @@ class IMPORT_OT_3dmigoto(bpy.types.Operator, ImportHelper):
     )
     auto_scale: BoolProperty(
         name="自动缩放 / Auto Scale",
-        description="根据模型包围盒自动估算比例，缩放到约1.7m人形高度 / Auto-estimate scale from bounding box, target ~1.7m humanoid height",
+        description="根据模型包围盒自动估算比例,缩放到约1.7m人形高度 / Auto-estimate scale from bounding box, target ~1.7m humanoid height",
         default=False,
     )
     game_format: bpy.props.EnumProperty(
         name="游戏 / Game",
         items=[
             ('auto', '自动检测 / Auto', '根据INI自动检测'),
-            ('sr', '崩铁 / Star Rail', '崩坏：星穹铁道'),
+            ('sr', '崩铁 / Star Rail', '崩坏:星穹铁道'),
             ('zzz', '绝区零 / ZZZ', '绝区零'),
             ('gi', '原神 / Genshin', '原神'),
             ('ww', '鸣潮 / Wuthering Waves', '鸣潮'),
-            ('ef', '终末地 / Endfield', '明日方舟：终末地'),
+            ('ef', '终末地 / Endfield', '明日方舟:终末地'),
         ],
         default='auto',
     )
     uv_format: bpy.props.EnumProperty(
         name="UV 格式 / UV Format",
         items=[
-            ('auto', '自动检测 / Auto', '自动检测UV格式（根据游戏选择会更准确）'),
+            ('auto', '自动检测 / Auto', '自动检测UV格式(根据游戏选择会更准确)'),
             ('hf0', 'Half-float @0', ''),
             ('hf4', 'Half-float @4', ''),
             ('u16_0', 'uint16 @0', ''),
@@ -1670,7 +2012,7 @@ class IMPORT_OT_3dmigoto(bpy.types.Operator, ImportHelper):
             ('f32_4', 'float32 @4', ''),
             ('f32_0', 'float32 @0', ''),
             ('u16_split', '终末地 VB2 / Endfield VB2', 'U@0 V@4 非连续uint16'),
-            ('ef_vb2', '终末地 VB2 @0 / Endfield VB2', 'uint16 @0 (VB2前4字节，跳过前9顶点)'),
+            ('ef_vb2', '终末地 VB2 @0 / Endfield VB2', 'uint16 @0 (VB2前4字节,跳过前9顶点)'),
         ],
         default='auto',
     )
@@ -1689,7 +2031,7 @@ class IMPORT_OT_3dmigoto(bpy.types.Operator, ImportHelper):
         cleanup_migoto_temp()
 
         ini_path = self.filepath
-        
+
         # If a directory is selected, find .ini files inside
         if os.path.isdir(ini_path):
             ini_found = None
@@ -1705,13 +2047,13 @@ class IMPORT_OT_3dmigoto(bpy.types.Operator, ImportHelper):
                 return {'CANCELLED'}
             ini_path = ini_found
             print(f"  [Migoto] Found INI in directory: {ini_path}")
-        
+
         # Handle archive files (ZIP/RAR/7z)
         if ini_path.lower().endswith(('.zip', '.rar', '.7z')):
             import tempfile
             extract_dir = tempfile.mkdtemp(prefix='migoto_')
             print(f"  [Migoto] Extracting archive to: {extract_dir}")
-            
+
             if ini_path.lower().endswith('.zip'):
                 import zipfile
                 with zipfile.ZipFile(ini_path, 'r') as zf:
@@ -1732,7 +2074,7 @@ class IMPORT_OT_3dmigoto(bpy.types.Operator, ImportHelper):
                 except Exception as e:
                     self.report({'ERROR'}, f'Cannot extract 7z: {e}. Install py7zr or extract manually.')
                     return {'CANCELLED'}
-            
+
             # Find INI file in extracted content
             ini_found = None
             for root, dirs, files in os.walk(extract_dir):
@@ -1742,14 +2084,14 @@ class IMPORT_OT_3dmigoto(bpy.types.Operator, ImportHelper):
                         break
                 if ini_found:
                     break
-            
+
             if not ini_found:
                 self.report({'ERROR'}, 'No .ini file found in archive')
                 return {'CANCELLED'}
-            
+
             ini_path = ini_found
             print(f"  [Migoto] Found INI: {ini_path}")
-        
+
         ini_dir = os.path.dirname(ini_path)
 
         # Find mod root: INI might be in a subdirectory (e.g. resources/)
@@ -1830,7 +2172,7 @@ class IMPORT_OT_3dmigoto(bpy.types.Operator, ImportHelper):
         # Game-specific default scales (game engine coordinate units -> Blender meters)
         GAME_DEFAULT_SCALE = {
             'ww': 0.01,   # Wuthering Waves (Unreal Engine, cm -> m)
-            'ef': 0.01,   # Endfield (Unreal Engine, cm -> m)
+            # 'ef' removed: Endfield is NOT Unreal Engine, no default scale needed
         }
         effective_scale = self.import_scale
 
@@ -1952,7 +2294,7 @@ class IMPORT_OT_3dmigoto(bpy.types.Operator, ImportHelper):
 
         # Use INI directory (not parent dirs) for texture scanning
         mod_root = ini_dir
-        
+
         # Create collection
         mod_name = safe_name(os.path.splitext(os.path.basename(ini_path))[0])
         coll = bpy.data.collections.new(mod_name)
@@ -2052,7 +2394,7 @@ class IMPORT_OT_3dmigoto(bpy.types.Operator, ImportHelper):
                 mat = materials.get(dc.get('section'))
 
                 obj, cnt = build_object(dc['name'], positions, uvs, tris, mat, coll,
-                                        mirror_faces=self.mirror_x or self.mirror_y or self.mirror_z,
+                                        mirror_faces=self.mirror_x or self.mirror_y or self.mirror_z or self.flip_normals,
                                         blend_weights=md.get('blend_weights'))
                 if cnt > 0:
                     obj_count += 1
@@ -2093,7 +2435,7 @@ class IMPORT_OT_3dmigoto(bpy.types.Operator, ImportHelper):
                     mat = materials.get(ib)
                     md = _resolve_lookup(mesh_data, ib)
                     obj, cnt = build_object(f"{mod_name}_merged", positions, uvs, tris, mat, coll,
-                                            mirror_faces=self.mirror_x or self.mirror_y or self.mirror_z,
+                                            mirror_faces=self.mirror_x or self.mirror_y or self.mirror_z or self.flip_normals,
                                             blend_weights=md.get('blend_weights') if md else None)
                     if cnt > 0:
                         obj_count += 1
@@ -2648,7 +2990,7 @@ class MIGOTO_PG_bone_item(bpy.types.PropertyGroup):
 
 
 class MIGOTO_UL_bone_list(bpy.types.UIList):
-    """骨骼列表（带滚动条）"""
+    """骨骼列表(带滚动条)"""
     bl_idname = "MIGOTO_UL_bone_list"
 
     def draw_item(self, context, layout, data, item, icon, active_data, active_property, index):
@@ -2788,7 +3130,7 @@ class MIGOTO_OT_toggle_obj_visibility(bpy.types.Operator):
 
 
 class MIGOTO_OT_highlight_obj(bpy.types.Operator):
-    """高亮选中对象（3D视图描边） / Highlight object in viewport"""
+    """高亮选中对象(3D视图描边) / Highlight object in viewport"""
     bl_idname = "migoto.highlight_obj"
     bl_label = "Highlight"
     bl_options = {'REGISTER', 'UNDO'}
@@ -2992,7 +3334,7 @@ class MIGOTO_OT_auto_group(bpy.types.Operator):
 
 
 class MIGOTO_UL_mesh_group_items(bpy.types.UIList):
-    """网格变体列表项（带勾选框和高亮按钮）"""
+    """网格变体列表项(带勾选框和高亮按钮)"""
     bl_idname = "MIGOTO_UL_mesh_group_items"
 
     def draw_item(self, context, layout, data, item, icon, active_data, active_property, index):
@@ -3026,7 +3368,7 @@ class MIGOTO_UL_mesh_group_items(bpy.types.UIList):
 
 
 class MIGOTO_UL_mesh_groups(bpy.types.UIList):
-    """分组列表（左侧选择）"""
+    """分组列表(左侧选择)"""
     bl_idname = "MIGOTO_UL_mesh_groups"
 
     def draw_item(self, context, layout, data, item, icon, active_data, active_property, index):
@@ -3037,7 +3379,7 @@ class MIGOTO_UL_mesh_groups(bpy.types.UIList):
 
 
 class MIGOTO_UL_texture_list(bpy.types.UIList):
-    """贴图列表（带预览和应用按钮）"""
+    """贴图列表(带预览和应用按钮)"""
     bl_idname = "MIGOTO_UL_texture_list"
 
     def draw_item(self, context, layout, data, item, icon, active_data, active_property, index):
@@ -3740,7 +4082,7 @@ class MIGOTO_PT_game_toggles(bpy.types.Panel):
 
 
 class MIGOTO_OT_auto_fill_textures(bpy.types.Operator):
-    """自动填充贴图（从INI解析） / Auto-fill textures from INI"""
+    """自动填充贴图(从INI解析) / Auto-fill textures from INI"""
     bl_idname = "migoto.auto_fill_textures"
     bl_label = "Auto Fill Textures"
     bl_options = {'REGISTER', 'UNDO'}
@@ -3864,7 +4206,7 @@ class MIGOTO_OT_rename_vertex_group(bpy.types.Operator):
 
 
 class MIGOTO_OT_show_vertex_weight(bpy.types.Operator):
-    """显示顶点组权重（进入权重绘制模式） / Show vertex weights (enter weight paint)"""
+    """显示顶点组权重(进入权重绘制模式) / Show vertex weights (enter weight paint)"""
     bl_idname = "migoto.show_vertex_weight"
     bl_label = "Show Weight"
     bl_options = {'REGISTER', 'UNDO'}
@@ -3992,12 +4334,12 @@ class MIGOTO_OT_generate_skeleton(bpy.types.Operator):
         obj.select_set(True)
         arm_obj.select_set(False)
 
-        self.report({'INFO'}, f'生成 {len(edit_bones)} 根骨骼（实验性）')
+        self.report({'INFO'}, f'生成 {len(edit_bones)} 根骨骼(实验性)')
         return {'FINISHED'}
 
 
 class MIGOTO_OT_bind_bone_to_group(bpy.types.Operator):
-    """将选中的骨骼名绑定到选中的顶点组（重命名顶点组以匹配骨骼名） / Bind selected bone name to selected vertex group"""
+    """将选中的骨骼名绑定到选中的顶点组(重命名顶点组以匹配骨骼名) / Bind selected bone name to selected vertex group"""
     bl_idname = "migoto.bind_bone_to_group"
     bl_label = "绑定骨骼到顶点组 / Bind Bone to Group"
     bl_options = {'REGISTER', 'UNDO'}
@@ -4182,7 +4524,7 @@ class MIGOTO_OT_auto_bind_by_position(bpy.types.Operator):
 
 
 class MIGOTO_OT_import_pmx_skeleton(bpy.types.Operator):
-    """从MMD tools导入的模型中提取骨架（先用MMD tools导入PMX，再点此按钮） / Extract skeleton from MMD-imported model"""
+    """从MMD tools导入的模型中提取骨架(先用MMD tools导入PMX,再点此按钮) / Extract skeleton from MMD-imported model"""
     bl_idname = "migoto.import_pmx_skeleton"
     bl_label = "提取MMD骨架 / Extract MMD Skeleton"
     bl_options = {'REGISTER', 'UNDO'}
@@ -4191,7 +4533,7 @@ class MIGOTO_OT_import_pmx_skeleton(bpy.types.Operator):
         # Find all armatures in scene
         armatures = [obj for obj in bpy.data.objects if obj.type == 'ARMATURE']
         if not armatures:
-            self.report({'ERROR'}, '场景中没有骨架，请先用MMD tools导入PMX')
+            self.report({'ERROR'}, '场景中没有骨架,请先用MMD tools导入PMX')
             return {'CANCELLED'}
 
         # Use active object if it's an armature, otherwise use the last one
@@ -4221,7 +4563,7 @@ class MIGOTO_OT_import_pmx_skeleton(bpy.types.Operator):
         arm.select_set(True)
         context.view_layer.objects.active = arm
 
-        self.report({'INFO'}, f'提取骨架: {arm.name}，删除 {deleted} 个MMD网格')
+        self.report({'INFO'}, f'提取骨架: {arm.name},删除 {deleted} 个MMD网格')
         return {'FINISHED'}
 
         def read_str(off, enc):
@@ -4463,43 +4805,43 @@ MMD_BONE_NAMES = {
     '右手首', 'wrist R', 'RightWrist', 'Wrist.R', '手首.R',
     # --- Fingers / 指 group (with numbered variants) ---
     '左親指', 'thumb L', 'LeftThumb', 'Thumb.L', '親指.L',
-    '左親指１', 'thumb1L', 'LeftThumb1', 'Thumb1.L', '親指１.L',
-    '左親指２', 'thumb2L', 'LeftThumb2', 'Thumb2.L', '親指２.L',
+    '左親指1', 'thumb1L', 'LeftThumb1', 'Thumb1.L', '親指1.L',
+    '左親指2', 'thumb2L', 'LeftThumb2', 'Thumb2.L', '親指2.L',
     '右親指', 'thumb R', 'RightThumb', 'Thumb.R', '親指.R',
-    '右親指１', 'thumb1R', 'RightThumb1', 'Thumb1.R', '親指１.R',
-    '右親指２', 'thumb2R', 'RightThumb2', 'Thumb2.R', '親指２.R',
+    '右親指1', 'thumb1R', 'RightThumb1', 'Thumb1.R', '親指1.R',
+    '右親指2', 'thumb2R', 'RightThumb2', 'Thumb2.R', '親指2.R',
     '左人指', 'fore L', 'LeftIndex', 'Index.L', '人指.L',
-    '左人指１', 'fore1L', 'LeftIndex1', 'Index1.L', '人指１.L',
-    '左人指２', 'fore2L', 'LeftIndex2', 'Index2.L', '人指２.L',
-    '左人指３', 'fore3L', 'LeftIndex3', 'Index3.L', '人指３.L',
+    '左人指1', 'fore1L', 'LeftIndex1', 'Index1.L', '人指1.L',
+    '左人指2', 'fore2L', 'LeftIndex2', 'Index2.L', '人指2.L',
+    '左人指3', 'fore3L', 'LeftIndex3', 'Index3.L', '人指3.L',
     '右人指', 'fore R', 'RightIndex', 'Index.R', '人指.R',
-    '右人指１', 'fore1R', 'RightIndex1', 'Index1.R', '人指１.R',
-    '右人指２', 'fore2R', 'RightIndex2', 'Index2.R', '人指２.R',
-    '右人指３', 'fore3R', 'RightIndex3', 'Index3.R', '人指３.R',
+    '右人指1', 'fore1R', 'RightIndex1', 'Index1.R', '人指1.R',
+    '右人指2', 'fore2R', 'RightIndex2', 'Index2.R', '人指2.R',
+    '右人指3', 'fore3R', 'RightIndex3', 'Index3.R', '人指3.R',
     '左中指', 'middle L', 'LeftMiddle', 'Middle.L', '中指.L',
-    '左中指１', 'middle1L', 'LeftMiddle1', 'Middle1.L', '中指１.L',
-    '左中指２', 'middle2L', 'LeftMiddle2', 'Middle2.L', '中指２.L',
-    '左中指３', 'middle3L', 'LeftMiddle3', 'Middle3.L', '中指３.L',
+    '左中指1', 'middle1L', 'LeftMiddle1', 'Middle1.L', '中指1.L',
+    '左中指2', 'middle2L', 'LeftMiddle2', 'Middle2.L', '中指2.L',
+    '左中指3', 'middle3L', 'LeftMiddle3', 'Middle3.L', '中指3.L',
     '右中指', 'middle R', 'RightMiddle', 'Middle.R', '中指.R',
-    '右中指１', 'middle1R', 'RightMiddle1', 'Middle1.R', '中指１.R',
-    '右中指２', 'middle2R', 'RightMiddle2', 'Middle2.R', '中指２.R',
-    '右中指３', 'middle3R', 'RightMiddle3', 'Middle3.R', '中指３.R',
+    '右中指1', 'middle1R', 'RightMiddle1', 'Middle1.R', '中指1.R',
+    '右中指2', 'middle2R', 'RightMiddle2', 'Middle2.R', '中指2.R',
+    '右中指3', 'middle3R', 'RightMiddle3', 'Middle3.R', '中指3.R',
     '左薬指', 'third L', 'LeftRing', 'Ring.L', '薬指.L',
-    '左薬指１', 'third1L', 'LeftRing1', 'Ring1.L', '薬指１.L',
-    '左薬指２', 'third2L', 'LeftRing2', 'Ring2.L', '薬指２.L',
-    '左薬指３', 'third3L', 'LeftRing3', 'Ring3.L', '薬指３.L',
+    '左薬指1', 'third1L', 'LeftRing1', 'Ring1.L', '薬指1.L',
+    '左薬指2', 'third2L', 'LeftRing2', 'Ring2.L', '薬指2.L',
+    '左薬指3', 'third3L', 'LeftRing3', 'Ring3.L', '薬指3.L',
     '右薬指', 'third R', 'RightRing', 'Ring.R', '薬指.R',
-    '右薬指１', 'third1R', 'RightRing1', 'Ring1.R', '薬指１.R',
-    '右薬指２', 'third2R', 'RightRing2', 'Ring2.R', '薬指２.R',
-    '右薬指３', 'third3R', 'RightRing3', 'Ring3.R', '薬指３.R',
+    '右薬指1', 'third1R', 'RightRing1', 'Ring1.R', '薬指1.R',
+    '右薬指2', 'third2R', 'RightRing2', 'Ring2.R', '薬指2.R',
+    '右薬指3', 'third3R', 'RightRing3', 'Ring3.R', '薬指3.R',
     '左小指', 'little L', 'LeftPinky', 'Little.L', '小指.L',
-    '左小指１', 'little1L', 'LeftPinky1', 'Little1.L', '小指１.L',
-    '左小指２', 'little2L', 'LeftPinky2', 'Little2.L', '小指２.L',
-    '左小指３', 'little3L', 'LeftPinky3', 'Little3.L', '小指３.L',
+    '左小指1', 'little1L', 'LeftPinky1', 'Little1.L', '小指1.L',
+    '左小指2', 'little2L', 'LeftPinky2', 'Little2.L', '小指2.L',
+    '左小指3', 'little3L', 'LeftPinky3', 'Little3.L', '小指3.L',
     '右小指', 'little R', 'RightPinky', 'Little.R', '小指.R',
-    '右小指１', 'little1R', 'RightPinky1', 'Little1.R', '小指１.R',
-    '右小指２', 'little2R', 'RightPinky2', 'Little2.R', '小指２.R',
-    '右小指３', 'little3R', 'RightPinky3', 'Little3.R', '小指３.R',
+    '右小指1', 'little1R', 'RightPinky1', 'Little1.R', '小指1.R',
+    '右小指2', 'little2R', 'RightPinky2', 'Little2.R', '小指2.R',
+    '右小指3', 'little3R', 'RightPinky3', 'Little3.R', '小指3.R',
     # --- Legs / 足 group ---
     '左足', 'leg L', 'LeftLeg', 'Leg.L', '足.L',
     '右足', 'leg R', 'RightLeg', 'Leg.R', '足.R',
@@ -4509,11 +4851,11 @@ MMD_BONE_NAMES = {
     '右足首', 'ankle R', 'RightAnkle', 'Ankle.R', '足首.R',
     '左つま先', 'toe L', 'LeftToe', 'Toe.L', 'つま先.L',
     '右つま先', 'toe R', 'RightToe', 'Toe.R', 'つま先.R',
-    # --- IK Bones / ＩＫ group ---
-    '左足ＩＫ', 'leg IK L', 'LeftFootIK', 'LegIK.L', '足ＩＫ.L',
-    '右足ＩＫ', 'leg IK R', 'RightFootIK', 'LegIK.R', '足ＩＫ.R',
-    '左つま先ＩＫ', 'toe IK L', 'LeftToeIK', 'ToeIK.L', 'つま先ＩＫ.L',
-    '右つま先ＩＫ', 'toe IK R', 'RightToeIK', 'ToeIK.R', 'つま先ＩＫ.R',
+    # --- IK Bones / IK group ---
+    '左足IK', 'leg IK L', 'LeftFootIK', 'LegIK.L', '足IK.L',
+    '右足IK', 'leg IK R', 'RightFootIK', 'LegIK.R', '足IK.R',
+    '左つま先IK', 'toe IK L', 'LeftToeIK', 'ToeIK.L', 'つま先IK.L',
+    '右つま先IK', 'toe IK R', 'RightToeIK', 'ToeIK.R', 'つま先IK.R',
     # --- Eyes / その他 group ---
     '左目', 'eye L', 'LeftEye', 'Eye.L', '目.L',
     '右目', 'eye R', 'RightEye', 'Eye.R', '目.R',
@@ -4523,7 +4865,7 @@ MMD_BONE_NAMES = {
 }
 
 # MMD bone name prefixes for prefix-based matching
-# Used to match numbered variants (e.g., 左親指１ matches 左親指)
+# Used to match numbered variants (e.g., 左親指1 matches 左親指)
 MMD_BONE_PREFIXES = {
     # Japanese prefixes (bare names without 左/右)
     '全ての親', 'グルーブ', 'センター', '腰',
@@ -4531,13 +4873,13 @@ MMD_BONE_PREFIXES = {
     '肩', '腕', 'ひじ', '手首',
     '親指', '人指', '中指', '薬指', '小指',
     '足', 'ひざ', '足首', 'つま先',
-    '足ＩＫ', 'つま先ＩＫ', '目', '歯', '舌',
+    '足IK', 'つま先IK', '目', '歯', '舌',
     # Japanese prefixes (with 左/右)
     '左肩', '右肩', '左腕', '右腕', '左ひじ', '右ひじ', '左手首', '右手首',
     '左親指', '右親指', '左人指', '右人指', '左中指', '右中指',
     '左薬指', '右薬指', '左小指', '右小指',
     '左足', '右足', '左ひざ', '右ひざ', '左足首', '右足首', '左つま先', '右つま先',
-    '左足ＩＫ', '右足ＩＫ', '左つま先ＩＫ', '右つま先ＩＫ',
+    '左足IK', '右足IK', '左つま先IK', '右つま先IK',
     '左目', '右目', '両目',
     # English prefixes
     'mother', 'groove', 'center', 'waist',
@@ -4582,8 +4924,8 @@ MMD_BONE_PREFIXES = {
     '親指.L', '親指.R', '人指.L', '人指.R', '中指.L', '中指.R',
     '薬指.L', '薬指.R', '小指.L', '小指.R',
     '足.L', '足.R', 'ひざ.L', 'ひざ.R', '足首.L', '足首.R',
-    'つま先.L', 'つま先.R', '足ＩＫ.L', '足ＩＫ.R',
-    'つま先ＩＫ.L', 'つま先ＩＫ.R', '目.L', '目.R',
+    'つま先.L', 'つま先.R', '足IK.L', '足IK.R',
+    'つま先IK.L', 'つま先IK.R', '目.L', '目.R',
 }
 
 
@@ -4674,7 +5016,7 @@ class MIGOTO_PT_bone_manager(bpy.types.Panel):
 
         # Other bones section
         box = layout.box()
-        box.label(text=f'其他骨骼 ({len(other_bones)}) — 可删除', icon='ERROR')
+        box.label(text=f'其他骨骼 ({len(other_bones)}) - 可删除', icon='ERROR')
         if len(other_bones) > 0:
             box.template_list(
                 'MIGOTO_UL_bone_list', '',
@@ -4720,7 +5062,7 @@ class MIGOTO_PT_vertex_groups(bpy.types.Panel):
         # Show vertex group list only for mesh objects
         if not obj or obj.type != 'MESH':
             if obj and obj.type == 'ARMATURE':
-                layout.label(text='骨架已选中，可用上方按钮操作', icon='ARMATURE_DATA')
+                layout.label(text='骨架已选中,可用上方按钮操作', icon='ARMATURE_DATA')
             else:
                 layout.label(text='请选中网格对象或骨架', icon='QUESTION')
             return

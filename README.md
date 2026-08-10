@@ -38,6 +38,7 @@ A Blender addon for importing 3Dmigoto/XXMI game mod models.
 - 📦 网格变体分组（按 MOD 分框 + 独立勾选显示/隐藏 + 高亮描边）
 - 📤 一键导出贴图（DDS 自动转 PNG）
 - 🔧 手动旋转 XYZ / 镜像 XYZ
+- 🔄 **翻转面朝向** — 修复 WW/EF 模型法线反转（默认开启）
 - 🎯 UV 格式自动检测 + 手动选择（含游戏专用格式）
 - 🌐 中英双语界面
 
@@ -75,6 +76,7 @@ File → Import → 3Dmigoto 模型 (.ini)
 |------|------|------|
 | 游戏 / Game | 游戏格式选择（影响 UV 解析和缩放） | 自动检测 |
 | 镜像 X/Y/Z | 翻转模型 | 关 |
+| 翻转面朝向 / Flip Normals | 反转法线方向（修复 WW/EF 模型面朝向） | 开 |
 | X/Y/Z 旋转 | 手动旋转角度 | 0° |
 | 缩放比例 / Scale | 手动缩放模型大小 | 1.0 |
 | 自动缩放 / Auto Scale | 根据包围盒自动估算比例（目标 ~1.7m） | 关 |
@@ -96,7 +98,7 @@ File → Import → 3Dmigoto 模型 (.ini)
 | 游戏 | 默认缩放 | 原因 |
 |------|----------|------|
 | 鸣潮 / Wuthering Waves | 0.01 | Unreal Engine，cm → m |
-| 终末地 / Endfield | 0.01 | Unreal Engine，cm → m |
+| 终末地 / Endfield | 1.0 | Unity，单位已接近米 |
 | 原神 / 崩铁 / 绝区零 | 1.0 | Unity，单位已接近米 |
 
 > 手动缩放值会覆盖游戏默认缩放。自动缩放可与手动缩放叠加使用。
@@ -112,7 +114,7 @@ File → Import → 3Dmigoto 模型 (.ini)
 | 绝区零 / ZZZ | 绝区零 | 自动检测 hf/u16/f32 |
 | 原神 / Genshin | 原神 | 自动检测 hf/u16/f32 |
 | 鸣潮 / Wuthering Waves | 鸣潮 | TexCoord stride 16 → hf@0 |
-| 终末地 / Endfield | 明日方舟：终末地 | VB1 stride 12 → f32@0 |
+| 终末地 / Endfield | 明日方舟：终末地 | VB1 stride 12 → f32@0 (无缩放) |
 
 ### UV 格式选择
 
@@ -254,7 +256,8 @@ Index:          R16_UINT / R32_UINT, 每部件独立 IB
 - 使用 `ref` 语法引用资源（`ib = ref Resource_Component0_IB`）
 - 支持 LOD 切换（`if $lod_level == 0` 条件分支）
 - 使用 `Meshes/` 子目录存放缓冲区文件
-- **模型缩放**：默认 0.01（Unreal Engine cm → m）
+- **模型缩放**：无默认缩放（Unity 引擎，单位接近米）
+- ⚠️ **顶点组权重暂不支持**：INI 中无显式 Blend 缓冲区引用，骨骼权重格式待研究
 
 ## 文件结构支持
 
@@ -288,15 +291,25 @@ MOD文件夹/
 |------|----------|----------|-------|-------|
 | 原神/崩铁 | stride 40, f32 | stride 8-20, hf/u16/f32 | stride 32, f32 | R32 |
 | 绝区零 | stride 40, f32 | stride 20-24, hf/u16/f32 | stride 32, f32 | R32 |
-| 鸣潮 | stride 12, f32 | stride 16, hf@0 | stride 8, R8 | R32 |
-| 终末地 | stride 16, f32 | stride 12, f32@0 (在VB1) | stride 12 | R16/R32 |
+| 鸣潮 | stride 12, f32 | stride 16, hf@0 | stride 16, R8_UINT | R32 |
+| 终末地 | stride 16, f32 | stride 12, f32@0 (在VB1) | ⚠️ 待研究 | R16/R32 |
 
 ## 更新日志 / Changelog
+
+### v3.17.0 — 鸣潮权重 & 面朝向修复
+
+- 🦴 **鸣潮顶点组权重**：修复 WW blend buffer (stride 16, R8_UINT) 的骨骼权重读取
+- 🔄 **面朝向修复**：新增「翻转面朝向 / Flip Normals」导入选项（默认开启），修复 WW/EF 模型法线反转
+- 🎮 **终末地缩放修复**：终末地为 Unity 引擎，移除错误的 0.01 缩放
+- 🔧 **INI 解析器扩展**：支持 vb3+ 和 vs-t 语法，全链路传递额外 VB 槽位
+- 🔧 **R8_UINT 检测改进**：检测阈值扩展到 stride≤16，新增 denormalized/tiny float 检测
+- 🔧 **多格式 blend 读取**：同时尝试 R8_UINT、uint8 bone-only、uint16 bone-only，自动选最佳
+- ⚠️ **终末地顶点组权重**：暂不支持（见已知限制）
 
 ### v3.16.0 — 模型缩放 & 骨骼管理重构
 
 - 📐 **模型缩放选项**：新增手动缩放比例和自动缩放功能
-- 📐 **游戏默认缩放**：鸣潮/终末地自动应用 0.01 缩放（cm → m）
+- 📐 **游戏默认缩放**：鸣潮自动应用 0.01 缩放（cm → m）
 - 📐 **自动缩放**：根据模型包围盒自动估算比例，目标 ~1.7m 人形高度
 - 🦴 **骨骼管理重构**：MMD 标准骨骼与其他骨骼分两个独立滚动列表显示
 - 🔍 **骨骼搜索过滤**：支持按名称实时过滤骨骼列表
@@ -446,6 +459,7 @@ MOD文件夹/
 - 不支持 Blend Shape（变形目标）
 - INI 条件逻辑通过游戏开关面板支持，但复杂嵌套条件可能不完整
 - 终末地 LOD 默认导入 LOD0
+- **终末地顶点组权重暂不支持**：终末地 INI 没有显式 Blend 缓冲区引用，骨骼权重格式未知，需要进一步逆向分析
 - 部分 DDS 贴图的 Alpha 通道为遮罩数据（全透明），需手动在贴图管理面板切换 Alpha 模式
 
 ## 许可证 / License
